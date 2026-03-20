@@ -38,7 +38,7 @@ APP_USERS = {
         username="emeza",
         display_name="Emmanuel Meza",
         role="seller",
-        crm_owner_name="Jesus Emmanuel Meza Guzmán",
+        crm_owner_name="Jesus Emmanuel Meza Guzm\u00e1n",
         password_hash=DEFAULT_PASSWORD_HASH,
     ),
 }

@@ -33,13 +33,13 @@ class SalesAssistantService:
 
     def answer_question(self, question: str, user: AppUser | None = None) -> AssistantResponse:
         intent = classify_question(question)
-        owner_scope = self._resolve_owner_scope_v2(question, user)
-        effective_question = self._normalize_user_scoped_question_v2(question, owner_scope)
+        owner_scope = self._resolve_owner_scope_v3(question, user)
+        effective_question = self._normalize_user_scoped_question_v3(question, owner_scope)
         evidence = self._collect_evidence(effective_question, intent, owner_scope=owner_scope)
         evidence["active_user"] = self._user_context(user)
         evidence["owner_scope"] = owner_scope
 
-        if evidence.get("direct_answer") and intent.mode in {"data", "analysis"}:
+        if evidence.get("direct_answer") and intent.mode == "data":
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
@@ -209,13 +209,14 @@ class SalesAssistantService:
                 evidence["recent_interactions"] = self._recent_interactions_for_entity(conn, entity_term)
                 evidence["recent_notes"] = self._recent_notes_for_entity(conn, entity_term)
 
-            if intent.asks_for_contact_directory and entity_term:
+            if entity_term and (
+                intent.asks_for_contact_directory
+                or (intent.asks_for_names and intent.asks_for_emails)
+                or (intent.asks_for_names and intent.asks_for_phones)
+            ):
                 evidence["direct_answer"] = self._contact_directory_for_entity(conn, entity_term)
             elif intent.asks_for_emails and entity_term:
-                if intent.asks_for_names:
-                    evidence["direct_answer"] = self._contact_directory_for_entity(conn, entity_term)
-                else:
-                    evidence["direct_answer"] = self._emails_for_entity(conn, entity_term)
+                evidence["direct_answer"] = self._emails_for_entity(conn, entity_term)
             elif intent.asks_for_assigned_clients:
                 effective_owner = owner_scope or self._owner_scope_from_question(question)
                 evidence["assigned_clients"] = self._assigned_clients(conn, effective_owner)
@@ -305,27 +306,20 @@ class SalesAssistantService:
         return evidence
 
     def _extract_entity_hint(self, question: str) -> str | None:
-        prefixes = [
-            "de ",
-            "del ",
-            "para ",
-            "cliente ",
-            "prospecto ",
-            "contacto ",
-            "prospecto: ",
-            "contacto: ",
-            "empresa: ",
-            "empresa ",
+        patterns = [
+            r"(?:correos?|emails?|telefonos?|teléfonos?|numeros?|números?|nombres?|contactos?)\s+(?:de|del)\s+(.+)$",
+            r"(?:cliente|prospecto|contacto|empresa)\s*:\s*(.+)$",
+            r"(?:plan|accion|acción|riesgos?|ultimo contacto|último contacto)\s+(?:de|del|para)\s+(.+)$",
+            r"(?:de|del|para)\s+(.+)$",
         ]
-        lower_question = question.lower()
-        for prefix in prefixes:
-            position = lower_question.find(prefix)
-            if position >= 0:
-                candidate = self._clean_search_term(question[position + len(prefix):].strip(" ?.:"))
+        for pattern in patterns:
+            match = re.search(pattern, question, flags=re.IGNORECASE)
+            if match:
+                candidate = self._clean_search_term(match.group(1).strip(" ?.:"))
                 if candidate:
                     return candidate
         if ":" in question:
-            trailing = self._clean_search_term(question.split(":")[-1].strip(" ?.:"))
+            trailing = self._clean_search_term(question.rsplit(":", 1)[-1].strip(" ?.:"))
             if trailing:
                 return trailing
         return None
@@ -339,6 +333,71 @@ class SalesAssistantService:
             "role": user.role,
             "crm_owner_name": user.crm_owner_name,
         }
+
+    def _resolve_owner_scope_v3(self, question: str, user: AppUser | None) -> str | None:
+        normalized = self._normalize_search_text(question)
+        global_markers = [
+            "global",
+            "todos los vendedores",
+            "todo el equipo",
+            "todo el departamento",
+            "equipo comercial",
+        ]
+        if any(marker in normalized for marker in global_markers):
+            return None
+        if "todos" in normalized and any(marker in normalized for marker in ["vendedores", "agentes", "propietarios", "equipo", "kpi", "kpis"]):
+            return None
+
+        mentioned_owners = self._mentioned_owner_names(question)
+        if mentioned_owners:
+            return mentioned_owners[0]
+
+        padded = f" {normalized} "
+        self_scope_signals = [
+            " mi ",
+            " mis ",
+            " conmigo ",
+            " yo ",
+            " debo ",
+            " tengo ",
+            " hable ",
+            " llame ",
+            " mis clientes",
+            " mis prospectos",
+            " mis notas",
+            " mis interacciones",
+            " mi cartera",
+        ]
+        if user and any(signal in padded for signal in self_scope_signals):
+            return user.crm_owner_name
+
+        if not user or user.role != "seller":
+            return None
+
+        seller_default_signals = [
+            "a quien debo llamar hoy",
+            "a quien le hable ayer",
+            "a quien le hable antier",
+            "compromisos pendientes para hoy",
+            "interacciones de ayer",
+            "interacciones de antier",
+            "actividad reciente",
+            "mis clientes",
+            "mis prospectos",
+            "mis notas",
+            "mi cartera",
+        ]
+        if any(self._normalize_search_text(signal) in normalized for signal in seller_default_signals):
+            return user.crm_owner_name
+        return None
+
+    def _normalize_user_scoped_question_v3(self, question: str, owner_scope: str | None) -> str:
+        if not owner_scope:
+            return question
+        normalized = self._normalize_search_text(question)
+        if any(token in f" {normalized} " for token in [" mi ", " mis ", " yo ", " conmigo "]):
+            return f"{question.strip()} del vendedor {owner_scope}"
+        return question
 
     def _resolve_owner_scope(self, question: str, user: AppUser | None) -> str | None:
         normalized = self._normalize_search_text(question)
@@ -443,7 +502,18 @@ class SalesAssistantService:
 
     def _owner_scope_from_question(self, question: str) -> str | None:
         normalized = self._normalize_search_text(question)
-        for alias, owner_name in self._owner_alias_map().items():
+        alias_map = {
+            "eduardo": "Eduardo Valdez",
+            "evaldez": "Eduardo Valdez",
+            "ceo": "Eduardo Valdez",
+            "pablo": "Pablo Melin Dorador",
+            "pmelin": "Pablo Melin Dorador",
+            "emmanuel": "Jesus Emmanuel Meza Guzmán",
+            "emeza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza guzman": "Jesus Emmanuel Meza Guzmán",
+        }
+        for alias, owner_name in alias_map.items():
             if alias in normalized:
                 return owner_name
         return None
@@ -451,7 +521,18 @@ class SalesAssistantService:
     def _mentioned_owner_names(self, question: str) -> list[str]:
         normalized = self._normalize_search_text(question)
         found: list[str] = []
-        for alias, owner_name in self._owner_alias_map().items():
+        alias_map = {
+            "eduardo": "Eduardo Valdez",
+            "evaldez": "Eduardo Valdez",
+            "ceo": "Eduardo Valdez",
+            "pablo": "Pablo Melin Dorador",
+            "pmelin": "Pablo Melin Dorador",
+            "emmanuel": "Jesus Emmanuel Meza Guzmán",
+            "emeza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza guzman": "Jesus Emmanuel Meza Guzmán",
+        }
+        for alias, owner_name in alias_map.items():
             if alias in normalized and owner_name not in found:
                 found.append(owner_name)
         return found
@@ -492,12 +573,29 @@ class SalesAssistantService:
                 score += 40
             if row.get("contact_name") and normalized_term == self._normalize_search_text(row["contact_name"]):
                 score += 30
+            if row.get("full_name") and normalized_term == self._normalize_search_text(row["full_name"]):
+                score += 25
 
-            if score > 0:
+            if normalized_term and score >= 20:
                 scored.append((score, row))
 
         scored.sort(key=lambda item: (-item[0], item[1].get("company_name") or item[1].get("full_name") or ""))
         return [row for _, row in scored[:10]]
+
+    def _filtered_matches_for_entity(self, conn: sqlite3.Connection, term: str) -> list[dict[str, Any]]:
+        normalized_term = self._normalize_search_text(self._clean_search_term(term))
+        matches = self._entity_matches(conn, term)
+        filtered: list[dict[str, Any]] = []
+        for match in matches:
+            fields = [
+                match.get("company_name") or "",
+                match.get("contact_name") or "",
+                match.get("full_name") or "",
+            ]
+            joined = self._normalize_search_text(" ".join(fields))
+            if normalized_term and normalized_term in joined:
+                filtered.append(match)
+        return filtered or matches[:3]
 
     def _recent_interactions_for_entity(self, conn: sqlite3.Connection, term: str) -> list[dict[str, Any]]:
         matches = self._entity_matches(conn, term)
@@ -558,7 +656,7 @@ class SalesAssistantService:
         return "\n".join(rows) if rows else "No encontre telefonos para ese cliente o prospecto."
 
     def _contact_directory_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
-        matches = self._entity_matches(conn, term)
+        matches = self._filtered_matches_for_entity(conn, term)
         notes = self._recent_notes_for_entity(conn, term)
         lines: list[str] = []
         seen: set[str] = set()
@@ -653,11 +751,25 @@ class SalesAssistantService:
                     continue
                 seen.add(cleaned_email)
                 if include_names:
-                    name = self._guess_contact_name_from_note(content, cleaned_email) or "Contacto en nota"
+                    name = self._guess_contact_name_from_note_v2(content, cleaned_email) or "Contacto en nota"
                     extracted.append(f"{name} | {cleaned_email}")
                 else:
                     extracted.append(cleaned_email)
         return extracted
+
+    def _guess_contact_name_from_note_v2(self, content: str, email: str) -> str | None:
+        patterns = [
+            rf"contacto correcto de ([A-Za-zÁÉÍÓÚÑáéíóúñ ]+) \([^)]*\).*?{re.escape(email)}",
+            rf"correo de ([A-Za-zÁÉÍÓÚÑáéíóúñ ]+).*?{re.escape(email)}",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return " ".join(match.group(1).split())
+        local_name = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+        if local_name:
+            return " ".join(part.capitalize() for part in local_name.split())
+        return None
 
     def _guess_contact_name_from_note(self, content: str, email: str) -> str | None:
         patterns = [
@@ -727,47 +839,34 @@ class SalesAssistantService:
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 
     def _owner_kpis(self, conn: sqlite3.Connection, owner_scope: str | None = None, window_days: int | None = None) -> dict[str, Any]:
-        lead_filters = []
-        contact_filters = []
-        note_filters = []
-        interaction_filters = []
-        task_filters = []
-        params: list[Any] = []
+        def where_clause(date_column: str) -> tuple[str, list[Any]]:
+            filters: list[str] = []
+            params_local: list[Any] = []
+            if owner_scope:
+                filters.append("owner_name = ?")
+                params_local.append(owner_scope)
+            if window_days:
+                filters.append(f"date({date_column}) >= date('now', ?)")
+                params_local.append(f"-{window_days} day")
+            return (f"WHERE {' AND '.join(filters)}" if filters else "", params_local)
 
-        if owner_scope:
-            lead_filters.append("owner_name = ?")
-            contact_filters.append("owner_name = ?")
-            note_filters.append("owner_name = ?")
-            interaction_filters.append("owner_name = ?")
-            task_filters.append("owner_name = ?")
-            params.append(owner_scope)
+        lead_where, lead_params = where_clause("COALESCE(modified_time, created_time)")
+        contact_where, contact_params = where_clause("COALESCE(modified_time, created_time)")
+        note_where, note_params = where_clause("created_time")
+        interaction_where, interaction_params = where_clause("interaction_at")
+        task_where, task_params = where_clause("COALESCE(due_date, created_time)")
 
-        if window_days:
-            lead_filters.append("date(COALESCE(modified_time, created_time)) >= date('now', ?)")
-            contact_filters.append("date(COALESCE(modified_time, created_time)) >= date('now', ?)")
-            note_filters.append("date(created_time) >= date('now', ?)")
-            interaction_filters.append("date(interaction_at) >= date('now', ?)")
-            task_filters.append("date(COALESCE(due_date, created_time)) >= date('now', ?)")
-            params.extend([f"-{window_days} day"] * 5)
-
-        lead_where = f"WHERE {' AND '.join(lead_filters)}" if lead_filters else ""
-        contact_where = f"WHERE {' AND '.join(contact_filters)}" if contact_filters else ""
-        note_where = f"WHERE {' AND '.join(note_filters)}" if note_filters else ""
-        interaction_where = f"WHERE {' AND '.join(interaction_filters)}" if interaction_filters else ""
-        task_where = f"WHERE {' AND '.join(task_filters)}" if task_filters else ""
-
-        split = 1 if owner_scope else 0
-        leads = conn.execute(f"SELECT COUNT(*) FROM leads {lead_where}", params[: split + (1 if window_days else 0)]).fetchone()[0]
-        contacts = conn.execute(f"SELECT COUNT(*) FROM contacts {contact_where}", params[: split + (1 if window_days else 0)]).fetchone()[0]
-        notes = conn.execute(f"SELECT COUNT(*) FROM notes {note_where}", params[: split + (1 if window_days else 0)]).fetchone()[0]
-        interactions = conn.execute(f"SELECT COUNT(*) FROM interactions {interaction_where}", params[: split + (1 if window_days else 0)]).fetchone()[0]
+        leads = conn.execute(f"SELECT COUNT(*) FROM leads {lead_where}", lead_params).fetchone()[0]
+        contacts = conn.execute(f"SELECT COUNT(*) FROM contacts {contact_where}", contact_params).fetchone()[0]
+        notes = conn.execute(f"SELECT COUNT(*) FROM notes {note_where}", note_params).fetchone()[0]
+        interactions = conn.execute(f"SELECT COUNT(*) FROM interactions {interaction_where}", interaction_params).fetchone()[0]
         open_tasks = conn.execute(
             f"SELECT COUNT(*) FROM tasks {task_where}{' AND ' if task_where else 'WHERE '}(status IS NULL OR lower(status) NOT IN ('completed', 'cancelled'))",
-            params[: split + (1 if window_days else 0)],
+            task_params,
         ).fetchone()[0]
         last_activity_row = conn.execute(
             f"SELECT MAX(interaction_at) FROM interactions {interaction_where}",
-            params[: split + (1 if window_days else 0)],
+            interaction_params,
         ).fetchone()
         return {
             "owner_scope": owner_scope,
@@ -933,7 +1032,7 @@ class SalesAssistantService:
         SELECT related_name, owner_name, source_type, interaction_at, status, summary
         FROM interactions
         WHERE interaction_at IS NOT NULL
-          AND date(interaction_at) = date('now', ?, 'localtime')
+          AND date(interaction_at, 'localtime') = date('now', 'localtime', ?)
         ORDER BY interaction_at DESC
         LIMIT 25
         """
@@ -942,7 +1041,7 @@ class SalesAssistantService:
             SELECT related_name, owner_name, source_type, interaction_at, status, summary
             FROM interactions
             WHERE interaction_at IS NOT NULL
-              AND date(interaction_at) = date('now', ?, 'localtime')
+              AND date(interaction_at, 'localtime') = date('now', 'localtime', ?)
               AND owner_name = ?
             ORDER BY interaction_at DESC
             LIMIT 25
@@ -1014,6 +1113,253 @@ class SalesAssistantService:
                 "advance_score": self._advance_score(matches, recent, notes, signals),
             })
         return results
+
+    def _clean_search_term(self, value: str) -> str:
+        cleaned = " ".join((value or "").strip(" ?.:,;").split())
+        removable_prefixes = [
+            "compara ",
+            "comparar ",
+            "comparativa ",
+            "dame ",
+            "solo ",
+            "ok ",
+            "cliente ",
+            "prospecto ",
+            "contacto ",
+            "contactos ",
+            "empresa ",
+            "nombres ",
+            "telefonos ",
+            "telefonos y correos ",
+            "telefonos y nombres ",
+            "correos y nombres ",
+            "de ",
+            "del ",
+        ]
+        lowered = cleaned.lower()
+        changed = True
+        while changed and lowered:
+            changed = False
+            for prefix in removable_prefixes:
+                if lowered.startswith(prefix):
+                    cleaned = cleaned[len(prefix):].strip()
+                    lowered = cleaned.lower()
+                    changed = True
+        return cleaned.strip()
+
+    def _owner_scope_from_question(self, question: str) -> str | None:
+        normalized = self._normalize_search_text(question)
+        alias_map = {
+            "eduardo": "Eduardo Valdez",
+            "evaldez": "Eduardo Valdez",
+            "ceo": "Eduardo Valdez",
+            "pablo": "Pablo Melin Dorador",
+            "pmelin": "Pablo Melin Dorador",
+            "emmanuel": "Jesus Emmanuel Meza Guzmán",
+            "emeza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza guzman": "Jesus Emmanuel Meza Guzmán",
+        }
+        for alias, owner_name in alias_map.items():
+            if alias in normalized:
+                return owner_name
+        return None
+
+    def _mentioned_owner_names(self, question: str) -> list[str]:
+        normalized = self._normalize_search_text(question)
+        found: list[str] = []
+        alias_map = {
+            "eduardo": "Eduardo Valdez",
+            "evaldez": "Eduardo Valdez",
+            "ceo": "Eduardo Valdez",
+            "pablo": "Pablo Melin Dorador",
+            "pmelin": "Pablo Melin Dorador",
+            "emmanuel": "Jesus Emmanuel Meza Guzmán",
+            "emeza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza guzman": "Jesus Emmanuel Meza Guzmán",
+        }
+        for alias, owner_name in alias_map.items():
+            if alias in normalized and owner_name not in found:
+                found.append(owner_name)
+        return found
+
+    def _field_values_for_entity(self, conn: sqlite3.Connection, term: str, field_name: str) -> list[str]:
+        matches = self._filtered_matches_for_entity(conn, term)
+        values = [match.get(field_name) for match in matches if match.get(field_name)]
+        deduplicated = sorted({value.strip() for value in values if value and value.strip()})
+        if deduplicated:
+            return deduplicated
+
+        wildcard = f"%{self._clean_search_term(term)}%"
+        query = f"""
+        SELECT DISTINCT {field_name}
+        FROM (
+            SELECT {field_name}, company_name, contact_name, full_name FROM leads
+            UNION ALL
+            SELECT {field_name}, company_name, contact_name, full_name FROM contacts
+        )
+        WHERE {field_name} IS NOT NULL
+          AND (
+              lower(company_name) LIKE lower(?)
+              OR lower(contact_name) LIKE lower(?)
+              OR lower(full_name) LIKE lower(?)
+          )
+        ORDER BY {field_name}
+        """
+        return [row[0] for row in conn.execute(query, (wildcard, wildcard, wildcard)).fetchall()]
+
+    def _emails_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        rows = self._field_values_for_entity(conn, term, "email")
+        note_emails = self._emails_from_notes(conn, term)
+        values = sorted({*rows, *note_emails})
+        return "\n".join(values) if values else "No encontre correos para ese cliente o prospecto."
+
+    def _phones_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        matches = self._filtered_matches_for_entity(conn, term)
+        lines: list[str] = []
+        seen: set[str] = set()
+        for match in matches:
+            phone = (match.get("phone") or "").strip()
+            if not phone:
+                continue
+            label = match.get("contact_name") or match.get("full_name") or match.get("company_name") or "Sin nombre"
+            key = f"{label}|{phone}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"{label} | {phone}")
+        return "\n".join(lines) if lines else "No encontre telefonos para ese cliente o prospecto."
+
+    def _contact_directory_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        matches = self._filtered_matches_for_entity(conn, term)
+        lines: list[str] = []
+        seen: set[str] = set()
+
+        for match in matches:
+            label = match.get("contact_name") or match.get("full_name") or match.get("company_name") or "Sin nombre"
+            email = match.get("email") or "Sin correo"
+            phone = match.get("phone") or "Sin telefono"
+            key = f"{self._normalize_search_text(label)}|{email.lower()}|{phone}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(
+                f"- {label} | Correo: {email} | Telefono: {phone} | Responsable CRM: {match.get('owner_name') or 'Sin responsable'}"
+            )
+
+        for contact in self._emails_from_notes(conn, term, include_names=True):
+            name, _, email = contact.partition(" | ")
+            normalized_name = self._normalize_search_text(name)
+            normalized_email = email.strip().lower()
+            key = f"{normalized_name}|{normalized_email}|Sin telefono"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- {name} | Correo: {normalized_email} | Telefono: Sin telefono | Fuente: nota CRM")
+
+        if not lines:
+            return f"No hay evidencia disponible sobre contactos de {term} en la informacion proporcionada."
+        return f"Contactos de {term} disponibles:\n\n" + "\n".join(lines)
+
+    def _interactions_on_relative_day(self, conn: sqlite3.Connection, days_ago: int, owner_scope: str | None = None) -> list[dict[str, Any]]:
+        modifier = f"-{days_ago} day"
+        query = """
+        SELECT related_name, owner_name, source_type, interaction_at, status, summary
+        FROM interactions
+        WHERE interaction_at IS NOT NULL
+          AND substr(interaction_at, 1, 10) = date('now', 'localtime', ?)
+        ORDER BY interaction_at DESC
+        LIMIT 25
+        """
+        params: list[Any] = [modifier]
+        if owner_scope:
+            query = """
+            SELECT related_name, owner_name, source_type, interaction_at, status, summary
+            FROM interactions
+            WHERE interaction_at IS NOT NULL
+              AND substr(interaction_at, 1, 10) = date('now', 'localtime', ?)
+              AND owner_name = ?
+            ORDER BY interaction_at DESC
+            LIMIT 25
+            """
+            params.append(owner_scope)
+        return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def _question_terms(self, question: str) -> list[str]:
+        stopwords = {
+            "de", "del", "la", "el", "los", "las", "para", "por", "que", "qué", "con", "sin",
+            "como", "cómo", "una", "uno", "unas", "unos", "hoy", "ayer", "antier", "quien", "quién",
+            "dame", "solo", "plan", "accion", "acción", "compara", "comparativa", "cliente", "prospecto",
+            "contacto", "contactos", "vendedor", "vendedores", "kpi", "kpis", "global", "semana",
+        }
+        normalized = self._normalize_search_text(question)
+        tokens = []
+        for token in re.findall(r"[a-z0-9]{3,}", normalized):
+            if token in stopwords:
+                continue
+            if token not in tokens:
+                tokens.append(token)
+        return tokens[:8]
+
+    def _document_search(self, conn: sqlite3.Connection, question: str) -> list[dict[str, Any]]:
+        terms = self._question_terms(question)
+        if not terms:
+            return []
+
+        clauses = " OR ".join(["lower(dc.content) LIKE lower(?)", "lower(d.file_name) LIKE lower(?)"] * len(terms))
+        values: list[str] = []
+        for term in terms:
+            values.extend([f"%{term}%", f"%{term}%"])
+
+        query = f"""
+        SELECT d.file_name, dc.chunk_index, dc.content
+        FROM document_chunks dc
+        JOIN documents d ON d.id = dc.document_id
+        WHERE {clauses}
+        LIMIT 8
+        """
+        try:
+            return [dict(row) for row in conn.execute(query, values).fetchall()]
+        except sqlite3.OperationalError:
+            return []
+
+    def _owner_scope_from_question(self, question: str) -> str | None:
+        normalized = self._normalize_search_text(question)
+        alias_map = {
+            "eduardo": "Eduardo Valdez",
+            "evaldez": "Eduardo Valdez",
+            "ceo": "Eduardo Valdez",
+            "pablo": "Pablo Melin Dorador",
+            "pmelin": "Pablo Melin Dorador",
+            "emmanuel": "Jesus Emmanuel Meza Guzm\u00e1n",
+            "emeza": "Jesus Emmanuel Meza Guzm\u00e1n",
+            "jesus emmanuel meza": "Jesus Emmanuel Meza Guzm\u00e1n",
+            "jesus emmanuel meza guzman": "Jesus Emmanuel Meza Guzm\u00e1n",
+        }
+        for alias, owner_name in alias_map.items():
+            if alias in normalized:
+                return owner_name
+        return None
+
+    def _mentioned_owner_names(self, question: str) -> list[str]:
+        normalized = self._normalize_search_text(question)
+        found: list[str] = []
+        alias_map = {
+            "eduardo": "Eduardo Valdez",
+            "evaldez": "Eduardo Valdez",
+            "ceo": "Eduardo Valdez",
+            "pablo": "Pablo Melin Dorador",
+            "pmelin": "Pablo Melin Dorador",
+            "emmanuel": "Jesus Emmanuel Meza Guzm\u00e1n",
+            "emeza": "Jesus Emmanuel Meza Guzm\u00e1n",
+            "jesus emmanuel meza": "Jesus Emmanuel Meza Guzm\u00e1n",
+            "jesus emmanuel meza guzman": "Jesus Emmanuel Meza Guzm\u00e1n",
+        }
+        for alias, owner_name in alias_map.items():
+            if alias in normalized and owner_name not in found:
+                found.append(owner_name)
+        return found
 
     def _commercial_signals(self, notes: list[dict[str, Any]]) -> list[str]:
         signal_keywords = {
@@ -1432,3 +1778,94 @@ Pregunta: {question}
 Evidencia:
 {evidence}
         """.strip()
+
+    def _build_prompt(self, question: str, intent: QuestionIntent, evidence: dict[str, Any]) -> str:
+        document_chunks = evidence.get("document_chunks") or []
+        document_hint = ""
+        if document_chunks:
+            doc_lines = []
+            for chunk in document_chunks[:4]:
+                preview = " ".join((chunk.get("content") or "").split())[:220]
+                doc_lines.append(f"- {chunk.get('file_name')} :: {preview}")
+            document_hint = "\nDocumentos internos relevantes:\n" + "\n".join(doc_lines)
+
+        return f"""
+Eres el asistente comercial del departamento de ventas de Flotimatics.
+
+Reglas obligatorias:
+- Usa solo la evidencia proporcionada.
+- No inventes datos.
+- Si falta evidencia, dilo claramente.
+- Solo menciona web si realmente se uso. En este caso no se uso web.
+- Si la pregunta es precisa, responde directo y sin relleno.
+- Si la pregunta pide analisis, separa hechos, interpretacion y recomendacion.
+- Si la pregunta trata de seguimiento o prioridad comercial, explica la razon concreta de la prioridad.
+- Si comparas prospectos, contrasta actividad reciente, notas, responsable y señales de avance.
+- Si hay usuario activo, interpreta las preguntas en primera persona según su perfil salvo que se mencione otro vendedor explícitamente.
+- Si hay fragmentos de PDFs internos relevantes, úsalos y menciona el nombre del archivo en la respuesta.
+- Si existe una respuesta directa previa en la evidencia, úsala como base, pero enriquécela con notas y PDFs cuando el modo sea analysis o hybrid.
+
+Modo detectado: {intent.mode}
+Pregunta: {question}
+{document_hint}
+
+Evidencia:
+{evidence}
+        """.strip()
+
+    def _clean_search_term(self, value: str) -> str:
+        cleaned = " ".join((value or "").strip(" ?.:,;").split())
+        removable_prefixes = [
+            "compara ",
+            "comparar ",
+            "comparativa ",
+            "dame ",
+            "solo ",
+            "ok ",
+            "cliente ",
+            "clientes ",
+            "prospecto ",
+            "prospectos ",
+            "contacto ",
+            "contactos ",
+            "empresa ",
+            "nombres ",
+            "telefonos ",
+            "telefonos y correos ",
+            "telefonos y nombres ",
+            "correos y nombres ",
+            "de ",
+            "del ",
+        ]
+        lowered = cleaned.lower()
+        changed = True
+        while changed and lowered:
+            changed = False
+            for prefix in removable_prefixes:
+                if lowered.startswith(prefix):
+                    cleaned = cleaned[len(prefix):].strip()
+                    lowered = cleaned.lower()
+                    changed = True
+        return cleaned.strip()
+
+    def _document_search(self, conn: sqlite3.Connection, question: str) -> list[dict[str, Any]]:
+        terms = self._question_terms(question)
+        if not terms:
+            return []
+
+        clauses = " OR ".join(["lower(dc.content) LIKE lower(?)", "lower(d.file_name) LIKE lower(?)"] * len(terms))
+        values: list[str] = []
+        for term in terms:
+            values.extend([f"%{term}%", f"%{term}%"])
+
+        query = f"""
+        SELECT d.file_name, dc.chunk_index, dc.content
+        FROM document_chunks dc
+        JOIN documents d ON d.id = dc.document_id
+        WHERE {clauses}
+        LIMIT 8
+        """
+        try:
+            return [dict(row) for row in conn.execute(query, values).fetchall()]
+        except sqlite3.OperationalError:
+            return []
