@@ -34,14 +34,32 @@ const recentActivityList = document.getElementById("recentActivityList");
 const historyList = document.getElementById("historyList");
 const prioritiesTable = document.getElementById("prioritiesTable");
 
+function formatCooldown(seconds) {
+  if (!seconds || seconds <= 0) return "";
+  return `${Math.ceil(seconds / 60)} min`;
+}
+
+async function readJsonSafely(response) {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    return await response.json();
+  }
+  const text = await response.text();
+  throw new Error(
+    text.startsWith("<!DOCTYPE")
+      ? "El servidor devolvio una pagina inesperada. Intenta de nuevo en unos minutos."
+      : text
+  );
+}
+
 async function checkHealth() {
   try {
     const response = await fetch("/health");
-    const data = await response.json();
+    const data = await readJsonSafely(response);
     healthStatus.textContent = data.status === "ok" ? "Conectada" : "Revisar";
-    healthDetail.textContent = "API local lista para responder y refrescar información.";
+    healthDetail.textContent = "API local lista para responder y refrescar informacion.";
   } catch (error) {
-    healthStatus.textContent = "Sin conexión";
+    healthStatus.textContent = "Sin conexion";
     healthDetail.textContent = "No fue posible conectar con la API local.";
   }
 }
@@ -50,17 +68,17 @@ async function fetchCurrentUser() {
   try {
     const response = await fetch("/me");
     if (!response.ok) {
-      throw new Error("Sin sesión");
+      throw new Error("Sin sesion");
     }
-    const data = await response.json();
+    const data = await readJsonSafely(response);
     sessionUser.textContent = data.display_name;
     sessionDetail.textContent = `Usuario activo: ${data.username}`;
     logoutButton.classList.remove("hidden");
     loginOverlay.classList.add("hidden");
     return data;
   } catch (error) {
-    sessionUser.textContent = "Sin sesión";
-    sessionDetail.textContent = "Inicia sesión para usar la plataforma.";
+    sessionUser.textContent = "Sin sesion";
+    sessionDetail.textContent = "Inicia sesion para usar la plataforma.";
     logoutButton.classList.add("hidden");
     loginOverlay.classList.remove("hidden");
     return null;
@@ -71,7 +89,7 @@ async function login() {
   const username = loginUsername.value.trim();
   const password = loginPassword.value;
   if (!username || !password) {
-    loginMessage.textContent = "Ingresa usuario y contraseña.";
+    loginMessage.textContent = "Ingresa usuario y contrasena.";
     return;
   }
 
@@ -87,15 +105,15 @@ async function login() {
       },
       body: JSON.stringify({ username, password }),
     });
-    const data = await response.json();
+    const data = await readJsonSafely(response);
     if (!response.ok) {
-      throw new Error(data.detail || "No se pudo iniciar sesión.");
+      throw new Error(data.detail || "No se pudo iniciar sesion.");
     }
     loginPassword.value = "";
     await fetchCurrentUser();
     await Promise.all([loadOwners(), loadDashboard(), loadHistory()]);
   } catch (error) {
-    loginMessage.textContent = error.message || "No se pudo iniciar sesión.";
+    loginMessage.textContent = error.message || "No se pudo iniciar sesion.";
   } finally {
     loginButton.disabled = false;
     loginButton.textContent = "Entrar";
@@ -143,7 +161,7 @@ async function askQuestion() {
       body: JSON.stringify({ question }),
     });
 
-    const data = await response.json();
+    const data = await readJsonSafely(response);
     if (!response.ok) {
       if (response.status === 401) {
         await fetchCurrentUser();
@@ -154,11 +172,11 @@ async function askQuestion() {
     answerOutput.textContent = data.answer;
     modePill.textContent = `Modo: ${data.mode}`;
     sourcePill.textContent = `Fuentes: ${data.sources.join(", ") || "-"}`;
-    webPill.textContent = `Web: ${data.used_web ? "sí" : "no"}`;
+    webPill.textContent = `Web: ${data.used_web ? "si" : "no"}`;
     await loadHistory();
   } catch (error) {
     answerOutput.textContent = "No se pudo obtener una respuesta.";
-    setBanner(error.message || "Ocurrió un error al consultar.", true);
+    setBanner(error.message || "Ocurrio un error al consultar.", true);
   } finally {
     askButton.disabled = false;
     askButton.textContent = "Preguntar";
@@ -175,26 +193,26 @@ async function refreshData() {
     const response = await fetch("/refresh", {
       method: "POST",
     });
-    const data = await response.json();
+    const data = await readJsonSafely(response);
     if (!response.ok) {
       if (response.status === 401) {
         await fetchCurrentUser();
       }
-      throw new Error(data.detail || "No se pudo actualizar la información.");
+      throw new Error(data.detail || "No se pudo actualizar la informacion.");
     }
 
     refreshOutput.innerHTML = `
-      <strong>Módulos sincronizados:</strong> ${data.synced_modules.join(", ")}<br>
+      <strong>Modulos sincronizados:</strong> ${data.synced_modules.join(", ")}<br>
       <strong>Warehouse:</strong> leads ${data.warehouse.leads}, contacts ${data.warehouse.contacts}, notes ${data.warehouse.notes}, calls ${data.warehouse.calls}, tasks ${data.warehouse.tasks}, events ${data.warehouse.events}, interactions ${data.warehouse.interactions}<br>
       <strong>Documentos indexados:</strong> ${data.indexed_documents}<br>
-      <strong>Última actualización:</strong> ${data.last_refresh || "sin dato"}<br>
-      <strong>Modo:</strong> ${data.refresh_mode || "ok"}
+      <strong>Ultima actualizacion:</strong> ${data.last_refresh || "sin dato"}<br>
+      <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.cooldown_seconds ? `<br><strong>Proxima sincronizacion manual:</strong> ${formatCooldown(data.cooldown_seconds)}` : ""}
     `;
-    setBanner(data.warning || "Actualización completada correctamente.");
+    setBanner(data.warning || "Actualizacion completada correctamente.");
     await Promise.all([loadDashboard(), loadOwners()]);
   } catch (error) {
-    refreshOutput.textContent = "La actualización no se completó.";
-    setBanner(error.message || "Ocurrió un error al refrescar.", true);
+    refreshOutput.textContent = "La actualizacion no se completo.";
+    setBanner(error.message || "Ocurrio un error al refrescar.", true);
   } finally {
     refreshButton.disabled = false;
     refreshButton.textContent = "Actualizar Zoho ahora";
@@ -207,7 +225,7 @@ async function loadOwners() {
     if (response.status === 401) {
       return;
     }
-    const data = await response.json();
+    const data = await readJsonSafely(response);
     ownerFilter.innerHTML = '<option value="">Todos</option>';
     data.forEach((owner) => {
       const option = document.createElement("option");
@@ -266,8 +284,8 @@ async function loadDashboard() {
     if (dashboardResponse.status === 401 || prioritiesResponse.status === 401) {
       return;
     }
-    const data = await dashboardResponse.json();
-    const prioritiesData = await prioritiesResponse.json();
+    const data = await readJsonSafely(dashboardResponse);
+    const prioritiesData = await readJsonSafely(prioritiesResponse);
 
     totalInteractions.textContent = String(data.total_interactions);
     activityTypes.textContent = data.by_type.length ? String(data.by_type.length) : "0";
@@ -311,7 +329,7 @@ async function loadDashboard() {
         { label: "Vendedor", render: (row) => row.owner_name || "-" },
         { label: "Prioridad", render: (row) => `<span class="priority-badge ${row.priority_label}">${row.priority_label}</span>` },
         { label: "Score", render: (row) => String(row.score ?? "-") },
-        { label: "Último toque", render: (row) => row.last_touch || "-" },
+        { label: "Ultimo toque", render: (row) => row.last_touch || "-" },
         { label: "Razones", render: (row) => (row.reasons || []).join("<br>") },
       ],
       prioritiesData.items || [],
@@ -320,8 +338,8 @@ async function loadDashboard() {
 
     if (data.last_refresh) {
       refreshOutput.innerHTML = `
-        <strong>Última actualización conocida:</strong> ${data.last_refresh}<br>
-        <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.warning ? `<br><strong>Estado:</strong> ${data.warning}` : ""}
+        <strong>Ultima actualizacion conocida:</strong> ${data.last_refresh}<br>
+        <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.cooldown_seconds ? `<br><strong>Proxima sincronizacion manual:</strong> ${formatCooldown(data.cooldown_seconds)}` : ""}${data.warning ? `<br><strong>Estado:</strong> ${data.warning}` : ""}
       `;
     }
   } catch (error) {
@@ -335,9 +353,9 @@ async function loadHistory() {
     if (response.status === 401) {
       return;
     }
-    const data = await response.json();
+    const data = await readJsonSafely(response);
     if (!data.length) {
-      historyList.textContent = "Todavía no hay preguntas registradas.";
+      historyList.textContent = "Todavia no hay preguntas registradas.";
       return;
     }
 
@@ -355,7 +373,7 @@ async function loadHistory() {
         answerOutput.textContent = item.answer;
         modePill.textContent = `Modo: ${item.mode || "-"}`;
         sourcePill.textContent = `Fuentes: ${item.sources || "-"}`;
-        webPill.textContent = `Web: ${item.used_web ? "sí" : "no"}`;
+        webPill.textContent = `Web: ${item.used_web ? "si" : "no"}`;
       });
       historyList.appendChild(wrapper);
     });

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,34 +47,42 @@ FRONTEND_DIR = PROJECT_ROOT / "frontend"
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 ensure_history_schema()
 ensure_runtime_schema()
+ZOHO_REFRESH_COOLDOWN_MINUTES = 10
 
 
 def prepare_local_state() -> None:
     build_warehouse()
     index_documents()
     ensure_history_schema()
-    _auto_refresh_if_empty()
 
 
-def _auto_refresh_if_empty() -> None:
-    counts = warehouse_counts()
-    if counts.get("leads", 0) > 0 or counts.get("contacts", 0) > 0:
-        return
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-    required = ["ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN"]
-    if not all(os.getenv(key) for key in required):
-        return
 
+def _parse_runtime_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
     try:
-        sync_zoho()
-        build_warehouse()
-        index_documents()
-        set_runtime_value("last_refresh", "startup_auto_refresh")
-        set_runtime_value("last_refresh_status", "ok")
-        set_runtime_value("last_refresh_error", "")
-    except Exception:
-        set_runtime_value("last_refresh_status", "snapshot_only")
-        return
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _refresh_cooldown_remaining_seconds() -> int:
+    last_attempt = get_runtime_value("last_refresh_attempt")
+    if not last_attempt:
+        return 0
+    attempt_time = _parse_runtime_timestamp(last_attempt["updated_at"])
+    if not attempt_time:
+        return 0
+    elapsed = _utcnow() - attempt_time
+    cooldown = timedelta(minutes=ZOHO_REFRESH_COOLDOWN_MINUTES)
+    remaining = cooldown - elapsed
+    return max(0, int(remaining.total_seconds()))
 
 
 class AskRequest(BaseModel):
@@ -105,6 +114,7 @@ class RefreshResponse(BaseModel):
     last_refresh: str | None = None
     refresh_mode: str | None = None
     warning: str | None = None
+    cooldown_seconds: int = 0
 
 
 class HistoryItem(BaseModel):
@@ -128,6 +138,7 @@ class DashboardResponse(BaseModel):
     last_refresh: str | None = None
     refresh_mode: str | None = None
     warning: str | None = None
+    cooldown_seconds: int = 0
 
 
 class PriorityResponse(BaseModel):
@@ -207,8 +218,29 @@ def ask(payload: AskRequest, user: UserResponse = Depends(require_user)) -> AskR
 
 @app.post("/refresh", response_model=RefreshResponse)
 def refresh(user: UserResponse = Depends(require_user)) -> RefreshResponse:
+    cooldown_seconds = _refresh_cooldown_remaining_seconds()
+    if cooldown_seconds > 0:
+        counts = warehouse_counts()
+        last_refresh = get_runtime_value("last_refresh")
+        refresh_status = get_runtime_value("last_refresh_status")
+        return RefreshResponse(
+            status="ok",
+            synced_modules=["leads", "contacts", "notes", "calls", "tasks", "events"],
+            warehouse=counts,
+            indexed_documents=0,
+            last_refresh=last_refresh["updated_at"] if last_refresh else None,
+            refresh_mode=refresh_status["value"] if refresh_status else "snapshot_only",
+            warning=(
+                f"Para evitar saturar Zoho, la siguiente sincronizacion manual estara disponible "
+                f"en aproximadamente {cooldown_seconds // 60 + (1 if cooldown_seconds % 60 else 0)} minuto(s). "
+                "Mientras tanto se usa el ultimo snapshot cargado."
+            ),
+            cooldown_seconds=cooldown_seconds,
+        )
+
     warning = None
     try:
+        set_runtime_value("last_refresh_attempt", "manual_attempt")
         sync_zoho()
         stats = build_warehouse()
         indexed_documents = index_documents()
@@ -225,15 +257,16 @@ def refresh(user: UserResponse = Depends(require_user)) -> RefreshResponse:
             last_refresh = get_runtime_value("last_refresh")
             refresh_status = get_runtime_value("last_refresh_status")
             warning = "No se pudo sincronizar Zoho en vivo. Se mantiene la informacion del ultimo snapshot cargado."
-            return RefreshResponse(
-                status="ok",
-                synced_modules=["leads", "contacts", "notes", "calls", "tasks", "events"],
-                warehouse=counts,
-                indexed_documents=0,
-                last_refresh=last_refresh["updated_at"] if last_refresh else None,
-                refresh_mode=refresh_status["value"] if refresh_status else "snapshot_only",
-                warning=warning,
-            )
+        return RefreshResponse(
+            status="ok",
+            synced_modules=["leads", "contacts", "notes", "calls", "tasks", "events"],
+            warehouse=counts,
+            indexed_documents=0,
+            last_refresh=last_refresh["updated_at"] if last_refresh else None,
+            refresh_mode=refresh_status["value"] if refresh_status else "snapshot_only",
+            warning=warning,
+            cooldown_seconds=ZOHO_REFRESH_COOLDOWN_MINUTES * 60,
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return RefreshResponse(
@@ -252,6 +285,7 @@ def refresh(user: UserResponse = Depends(require_user)) -> RefreshResponse:
         last_refresh=last_refresh["updated_at"] if last_refresh else None,
         refresh_mode=refresh_status["value"] if refresh_status else "ok",
         warning=warning,
+        cooldown_seconds=ZOHO_REFRESH_COOLDOWN_MINUTES * 60,
     )
 
 
@@ -277,6 +311,7 @@ def dashboard(
         last_refresh = get_runtime_value("last_refresh")
         refresh_status = get_runtime_value("last_refresh_status")
         refresh_error = get_runtime_value("last_refresh_error")
+        cooldown_seconds = _refresh_cooldown_remaining_seconds()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     warning = None
@@ -289,6 +324,7 @@ def dashboard(
         last_refresh=last_refresh["updated_at"] if last_refresh else None,
         refresh_mode=refresh_status["value"] if refresh_status else None,
         warning=warning,
+        cooldown_seconds=cooldown_seconds,
     )
 
 
