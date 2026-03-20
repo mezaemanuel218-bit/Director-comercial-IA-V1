@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
@@ -204,11 +205,16 @@ class SalesAssistantService:
                 evidence["recent_notes"] = self._recent_notes_for_entity(conn, entity_term)
 
             if intent.asks_for_emails and entity_term:
-                evidence["direct_answer"] = self._emails_for_entity(conn, entity_term)
+                if intent.asks_for_names:
+                    evidence["direct_answer"] = self._contact_points_for_entity(conn, entity_term)
+                else:
+                    evidence["direct_answer"] = self._emails_for_entity(conn, entity_term)
             elif intent.asks_for_phones and entity_term:
                 evidence["direct_answer"] = self._phones_for_entity(conn, entity_term)
             elif intent.asks_for_owner_load:
                 evidence["owner_load"] = self._owner_load(conn)
+                if not evidence["owner_load"]:
+                    evidence["owner_load"] = self._owner_load_from_interactions(conn)
                 evidence["direct_answer"] = self._format_owner_load(evidence["owner_load"])
             elif intent.asks_for_yesterday_contacts:
                 evidence["yesterday_contacts"] = self._interactions_on_relative_day(conn, 1)
@@ -361,6 +367,8 @@ class SalesAssistantService:
 
     def _emails_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
         rows = self._field_values_for_entity(conn, term, "email")
+        note_emails = self._emails_from_notes(conn, term)
+        rows = sorted({*rows, *note_emails})
         return "\n".join(rows) if rows else "No encontre correos para ese cliente o prospecto."
 
     def _phones_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
@@ -392,6 +400,67 @@ class SalesAssistantService:
         """
         return [row[0] for row in conn.execute(query, (wildcard, wildcard, wildcard)).fetchall()]
 
+    def _contact_points_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        matches = self._entity_matches(conn, term)
+        rows: list[str] = []
+        seen: set[str] = set()
+
+        for match in matches:
+            name = match.get("contact_name") or match.get("full_name") or match.get("company_name") or "Sin nombre"
+            email = match.get("email")
+            if not email:
+                continue
+            key = f"{name.lower()}|{email.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(f"{name} | {email}")
+
+        note_contacts = self._emails_from_notes(conn, term, include_names=True)
+        for item in note_contacts:
+            if item.lower() in seen:
+                continue
+            seen.add(item.lower())
+            rows.append(item)
+
+        if rows:
+            return "\n".join(rows)
+        return "No encontre nombres y correos para ese cliente o prospecto."
+
+    def _emails_from_notes(self, conn: sqlite3.Connection, term: str, include_names: bool = False) -> list[str]:
+        notes = self._recent_notes_for_entity(conn, term)
+        extracted: list[str] = []
+        seen: set[str] = set()
+        for note in notes:
+            content = note.get("content_text") or ""
+            emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", content)
+            for email in emails:
+                cleaned_email = email.strip().strip(".,;:()[]<>").lower()
+                if cleaned_email in seen:
+                    continue
+                seen.add(cleaned_email)
+                if include_names:
+                    name = self._guess_contact_name_from_note(content, cleaned_email) or "Contacto en nota"
+                    extracted.append(f"{name} | {cleaned_email}")
+                else:
+                    extracted.append(cleaned_email)
+        return extracted
+
+    def _guess_contact_name_from_note(self, content: str, email: str) -> str | None:
+        patterns = [
+            rf"contacto correcto de ([A-Za-zÁÉÍÓÚÑáéíóúñ ]+) \([^)]*\).*?{re.escape(email)}",
+            rf"correo de ([A-Za-zÁÉÍÓÚÑáéíóúñ ]+).*?{re.escape(email)}",
+            rf"con ([A-Za-zÁÉÍÓÚÑáéíóúñ ]+) en copia.*?{re.escape(email)}",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return " ".join(match.group(1).split())
+        local_name = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+        if local_name:
+            return " ".join(part.capitalize() for part in local_name.split())
+        return None
+
     def _owner_load(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         query = """
         SELECT owner_name, COUNT(*) AS total_records
@@ -401,6 +470,16 @@ class SalesAssistantService:
             SELECT owner_name FROM contacts
         )
         WHERE owner_name IS NOT NULL
+        GROUP BY owner_name
+        ORDER BY total_records DESC, owner_name ASC
+        """
+        return [dict(row) for row in conn.execute(query).fetchall()]
+
+    def _owner_load_from_interactions(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        query = """
+        SELECT owner_name, COUNT(DISTINCT related_id) AS total_records
+        FROM interactions
+        WHERE owner_name IS NOT NULL AND related_id IS NOT NULL
         GROUP BY owner_name
         ORDER BY total_records DESC, owner_name ASC
         """
@@ -506,6 +585,7 @@ class SalesAssistantService:
             notes = self._recent_notes_for_entity(conn, term)
             latest_touch = recent[0]["interaction_at"] if recent else None
             owner_names = sorted({match.get("owner_name") for match in matches if match.get("owner_name")})
+            signals = self._commercial_signals(notes)
             results.append({
                 "term": term,
                 "matches": matches[:3],
@@ -514,8 +594,52 @@ class SalesAssistantService:
                 "latest_touch": latest_touch,
                 "owners": owner_names,
                 "interaction_count": len(recent),
+                "signals": signals,
+                "advance_score": self._advance_score(matches, recent, notes, signals),
             })
         return results
+
+    def _commercial_signals(self, notes: list[dict[str, Any]]) -> list[str]:
+        signal_keywords = {
+            "demo": "Hay solicitud o referencia de demo.",
+            "cotiz": "Hay referencia a cotizacion.",
+            "seguimiento": "Hay seguimiento documentado.",
+            "interes": "Hay senal de interes.",
+            "prueba": "Hay referencia a prueba.",
+            "visita": "Hay visita registrada.",
+            "correo": "Hay correo documentado.",
+            "llamad": "Hay llamada documentada.",
+            "reunion": "Hay reunion mencionada.",
+            "propuesta": "Hay propuesta mencionada.",
+        }
+        combined = " || ".join((note.get("content_text") or "").lower() for note in notes)
+        found: list[str] = []
+        for keyword, description in signal_keywords.items():
+            if keyword in combined:
+                found.append(description)
+        return found[:5]
+
+    def _advance_score(
+        self,
+        matches: list[dict[str, Any]],
+        recent_interactions: list[dict[str, Any]],
+        notes: list[dict[str, Any]],
+        signals: list[str],
+    ) -> int:
+        score = 0
+        if matches:
+            score += 10
+        if any(match.get("owner_name") for match in matches):
+            score += 10
+        score += min(20, len(recent_interactions) * 4)
+        score += min(20, len(notes) * 3)
+        score += min(20, len(signals) * 4)
+        combined = " || ".join((note.get("content_text") or "").lower() for note in notes)
+        if "rechaz" in combined or "no cree" in combined:
+            score -= 8
+        if "espera de respuesta" in combined or "pendiente" in combined:
+            score += 4
+        return score
 
     def _normalize_search_text(self, value: str) -> str:
         normalized = unicodedata.normalize("NFKD", value or "")
@@ -657,6 +781,7 @@ class SalesAssistantService:
 
         formatted_sections: list[str] = []
         valid_candidates = 0
+        scored_candidates: list[dict[str, Any]] = []
         for candidate in rows[:2]:
             top_match = candidate["matches"][0] if candidate.get("matches") else None
             recent_note = candidate["recent_notes"][0] if candidate.get("recent_notes") else None
@@ -682,6 +807,8 @@ class SalesAssistantService:
                 note_summary = recent_note.get("content_text") or recent_note.get("title") or "Nota sin contenido visible."
                 note_summary = " ".join(note_summary.split())[:180]
 
+            signals = candidate.get("signals") or []
+
             formatted_sections.append(
                 "\n".join(
                     [
@@ -691,15 +818,37 @@ class SalesAssistantService:
                         f"- Interacciones recientes detectadas: {candidate.get('interaction_count', 0)}",
                         f"- Correo: {email}",
                         f"- Telefono: {phone}",
+                        f"- Senales comerciales: {', '.join(signals) if signals else 'Sin senales claras'}",
                         f"- Nota reciente: {note_summary}",
                     ]
                 )
+            )
+            scored_candidates.append(
+                {
+                    "name": entity_name,
+                    "score": candidate.get("advance_score", 0),
+                    "signals": signals,
+                    "latest_touch": candidate.get("latest_touch"),
+                    "owners": owners,
+                }
             )
 
         if valid_candidates == 0:
             return None
 
-        return "Comparativa encontrada:\n\n" + "\n\n".join(formatted_sections)
+        scored_candidates.sort(key=lambda item: item["score"], reverse=True)
+        leader = scored_candidates[0]
+        trailer = scored_candidates[-1]
+
+        closing = (
+            f"Conclusion:\n{leader['name']} va mas avanzado que {trailer['name']} "
+            f"porque acumula mas evidencia comercial util en notas, interacciones y asignacion de propietario "
+            f"(score {leader['score']} vs {trailer['score']})."
+        )
+        if leader["signals"]:
+            closing += f" Las senales mas claras son: {', '.join(leader['signals'][:3])}."
+
+        return "Comparativa encontrada:\n\n" + "\n\n".join(formatted_sections) + "\n\n" + closing
 
     def _format_last_interactions(self, rows: list[dict[str, Any]]) -> str:
         if not rows:

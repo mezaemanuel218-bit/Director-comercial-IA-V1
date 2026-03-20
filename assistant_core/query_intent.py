@@ -10,6 +10,7 @@ class QuestionIntent:
     mode: ResponseMode
     wants_web: bool
     asks_for_emails: bool
+    asks_for_names: bool
     asks_for_phones: bool
     asks_for_owner_load: bool
     asks_for_last_contact: bool
@@ -27,6 +28,7 @@ def classify_question(question: str) -> QuestionIntent:
     q = question.lower()
 
     asks_for_emails = "correo" in q or "mail" in q or "email" in q
+    asks_for_names = "nombre" in q or "nombres" in q or "persona" in q or "personas" in q or "contacto" in q or "contactos" in q
     asks_for_phones = "telefono" in q or "teléfono" in q or "numero" in q or "número" in q
     asks_for_owner_load = (
         ("cuantos clientes" in q or "cuántos clientes" in q or "asignados" in q or "carga" in q)
@@ -89,6 +91,7 @@ def classify_question(question: str) -> QuestionIntent:
         mode=mode,
         wants_web=wants_web,
         asks_for_emails=asks_for_emails,
+        asks_for_names=asks_for_names,
         asks_for_phones=asks_for_phones,
         asks_for_owner_load=asks_for_owner_load,
         asks_for_last_contact=asks_for_last_contact,
