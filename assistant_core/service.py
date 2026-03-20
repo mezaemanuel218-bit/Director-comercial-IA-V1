@@ -33,8 +33,8 @@ class SalesAssistantService:
 
     def answer_question(self, question: str, user: AppUser | None = None) -> AssistantResponse:
         intent = classify_question(question)
-        owner_scope = self._resolve_owner_scope(question, user)
-        effective_question = self._normalize_user_scoped_question(question, owner_scope)
+        owner_scope = self._resolve_owner_scope_v2(question, user)
+        effective_question = self._normalize_user_scoped_question_v2(question, owner_scope)
         evidence = self._collect_evidence(effective_question, intent, owner_scope=owner_scope)
         evidence["active_user"] = self._user_context(user)
         evidence["owner_scope"] = owner_scope
@@ -283,12 +283,22 @@ class SalesAssistantService:
             "cliente ",
             "prospecto ",
             "contacto ",
+            "prospecto: ",
+            "contacto: ",
+            "empresa: ",
+            "empresa ",
         ]
         lower_question = question.lower()
         for prefix in prefixes:
             position = lower_question.find(prefix)
             if position >= 0:
-                return self._clean_search_term(question[position + len(prefix):].strip(" ?."))
+                candidate = self._clean_search_term(question[position + len(prefix):].strip(" ?.:"))
+                if candidate:
+                    return candidate
+        if ":" in question:
+            trailing = self._clean_search_term(question.split(":")[-1].strip(" ?.:"))
+            if trailing:
+                return trailing
         return None
 
     def _user_context(self, user: AppUser | None) -> dict[str, Any] | None:
@@ -341,6 +351,49 @@ class SalesAssistantService:
         if not owner_scope:
             return question
         if any(token in question.lower() for token in [" mi ", " mis ", " yo ", "mias", "mios", "mías", "míos"]):
+            return f"{question.strip()} del vendedor {owner_scope}"
+        return question
+
+    def _resolve_owner_scope_v2(self, question: str, user: AppUser | None) -> str | None:
+        normalized = self._normalize_search_text(question)
+        aliases = {
+            "eduardo": "Eduardo Valdez",
+            "evaldez": "Eduardo Valdez",
+            "ceo": "Eduardo Valdez",
+            "pablo": "Pablo Melin Dorador",
+            "pmelin": "Pablo Melin Dorador",
+            "emmanuel": "Jesus Emmanuel Meza Guzmán",
+            "emeza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza guzman": "Jesus Emmanuel Meza Guzmán",
+        }
+        for alias, owner_name in aliases.items():
+            if alias in normalized:
+                return owner_name
+
+        self_scope_signals = [" mi ", " mis ", " conmigo ", " yo ", "mias", "mios", "mías", "míos", " debo ", " tengo ", " hable ", " hablé "]
+        padded = f" {normalized} "
+        if user and any(signal in padded for signal in self_scope_signals):
+            return user.crm_owner_name
+
+        if user and user.role == "seller":
+            seller_default_signals = [
+                "a quien debo llamar hoy",
+                "a quien le hable ayer",
+                "a quien le hable antier",
+                "compromisos pendientes para hoy",
+                "kpi",
+                "kpis",
+            ]
+            if any(self._normalize_search_text(signal) in normalized for signal in seller_default_signals):
+                return user.crm_owner_name
+        return None
+
+    def _normalize_user_scoped_question_v2(self, question: str, owner_scope: str | None) -> str:
+        if not owner_scope:
+            return question
+        normalized = self._normalize_search_text(question)
+        if any(token in f" {normalized} " for token in [" mi ", " mis ", " yo ", "mias", "mios"]):
             return f"{question.strip()} del vendedor {owner_scope}"
         return question
 
