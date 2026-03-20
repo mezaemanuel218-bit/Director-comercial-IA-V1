@@ -187,9 +187,10 @@ async function refreshData() {
       <strong>Módulos sincronizados:</strong> ${data.synced_modules.join(", ")}<br>
       <strong>Warehouse:</strong> leads ${data.warehouse.leads}, contacts ${data.warehouse.contacts}, notes ${data.warehouse.notes}, calls ${data.warehouse.calls}, tasks ${data.warehouse.tasks}, events ${data.warehouse.events}, interactions ${data.warehouse.interactions}<br>
       <strong>Documentos indexados:</strong> ${data.indexed_documents}<br>
-      <strong>Última actualización:</strong> ${data.last_refresh || "sin dato"}
+      <strong>Última actualización:</strong> ${data.last_refresh || "sin dato"}<br>
+      <strong>Modo:</strong> ${data.refresh_mode || "ok"}
     `;
-    setBanner("Actualización completada correctamente.");
+    setBanner(data.warning || "Actualización completada correctamente.");
     await Promise.all([loadDashboard(), loadOwners()]);
   } catch (error) {
     refreshOutput.textContent = "La actualización no se completó.";
@@ -318,7 +319,10 @@ async function loadDashboard() {
     );
 
     if (data.last_refresh) {
-      refreshOutput.innerHTML = `<strong>Última actualización conocida:</strong> ${data.last_refresh}`;
+      refreshOutput.innerHTML = `
+        <strong>Última actualización conocida:</strong> ${data.last_refresh}<br>
+        <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.warning ? `<br><strong>Estado:</strong> ${data.warning}` : ""}
+      `;
     }
   } catch (error) {
     console.error(error);

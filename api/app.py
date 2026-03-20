@@ -13,7 +13,7 @@ from assistant_core.config import PROJECT_ROOT
 from assistant_core.documents import index_documents
 from assistant_core.history import ensure_history_schema, fetch_history, save_history
 from assistant_core.reporting import available_owners, dashboard_metrics
-from assistant_core.runtime_state import get_runtime_value, set_runtime_value
+from assistant_core.runtime_state import ensure_runtime_schema, get_runtime_value, set_runtime_value
 from assistant_core.service import SalesAssistantService
 from assistant_core.warehouse import build_warehouse, warehouse_counts
 from scripts.sync_zoho import run as sync_zoho
@@ -45,6 +45,7 @@ FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 ensure_history_schema()
+ensure_runtime_schema()
 
 
 def prepare_local_state() -> None:
@@ -68,7 +69,10 @@ def _auto_refresh_if_empty() -> None:
         build_warehouse()
         index_documents()
         set_runtime_value("last_refresh", "startup_auto_refresh")
+        set_runtime_value("last_refresh_status", "ok")
+        set_runtime_value("last_refresh_error", "")
     except Exception:
+        set_runtime_value("last_refresh_status", "snapshot_only")
         return
 
 
@@ -99,6 +103,8 @@ class RefreshResponse(BaseModel):
     warehouse: dict[str, int]
     indexed_documents: int
     last_refresh: str | None = None
+    refresh_mode: str | None = None
+    warning: str | None = None
 
 
 class HistoryItem(BaseModel):
@@ -120,6 +126,8 @@ class DashboardResponse(BaseModel):
     stale_contacts: list[dict]
     recent_activity: list[dict]
     last_refresh: str | None = None
+    refresh_mode: str | None = None
+    warning: str | None = None
 
 
 class PriorityResponse(BaseModel):
@@ -199,13 +207,33 @@ def ask(payload: AskRequest, user: UserResponse = Depends(require_user)) -> AskR
 
 @app.post("/refresh", response_model=RefreshResponse)
 def refresh(user: UserResponse = Depends(require_user)) -> RefreshResponse:
+    warning = None
     try:
         sync_zoho()
         stats = build_warehouse()
         indexed_documents = index_documents()
         set_runtime_value("last_refresh", "manual_refresh")
+        set_runtime_value("last_refresh_status", "ok")
+        set_runtime_value("last_refresh_error", "")
         last_refresh = get_runtime_value("last_refresh")
+        refresh_status = get_runtime_value("last_refresh_status")
     except Exception as exc:
+        counts = warehouse_counts()
+        if counts.get("leads", 0) > 0 or counts.get("contacts", 0) > 0:
+            set_runtime_value("last_refresh_status", "snapshot_only")
+            set_runtime_value("last_refresh_error", str(exc))
+            last_refresh = get_runtime_value("last_refresh")
+            refresh_status = get_runtime_value("last_refresh_status")
+            warning = "No se pudo sincronizar Zoho en vivo. Se mantiene la informacion del ultimo snapshot cargado."
+            return RefreshResponse(
+                status="ok",
+                synced_modules=["leads", "contacts", "notes", "calls", "tasks", "events"],
+                warehouse=counts,
+                indexed_documents=0,
+                last_refresh=last_refresh["updated_at"] if last_refresh else None,
+                refresh_mode=refresh_status["value"] if refresh_status else "snapshot_only",
+                warning=warning,
+            )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return RefreshResponse(
@@ -222,6 +250,8 @@ def refresh(user: UserResponse = Depends(require_user)) -> RefreshResponse:
         },
         indexed_documents=indexed_documents,
         last_refresh=last_refresh["updated_at"] if last_refresh else None,
+        refresh_mode=refresh_status["value"] if refresh_status else "ok",
+        warning=warning,
     )
 
 
@@ -245,9 +275,21 @@ def dashboard(
     try:
         data = dashboard_metrics(owner=owner, date_from=date_from, date_to=date_to, status=status)
         last_refresh = get_runtime_value("last_refresh")
+        refresh_status = get_runtime_value("last_refresh_status")
+        refresh_error = get_runtime_value("last_refresh_error")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return DashboardResponse(**data, last_refresh=last_refresh["updated_at"] if last_refresh else None)
+    warning = None
+    if refresh_status and refresh_status["value"] == "snapshot_only":
+        warning = "Usando snapshot local. La sincronizacion en vivo con Zoho no esta disponible en este momento."
+        if refresh_error and refresh_error["value"]:
+            warning += f" Error: {refresh_error['value']}"
+    return DashboardResponse(
+        **data,
+        last_refresh=last_refresh["updated_at"] if last_refresh else None,
+        refresh_mode=refresh_status["value"] if refresh_status else None,
+        warning=warning,
+    )
 
 
 @app.get("/owners", response_model=list[str])
