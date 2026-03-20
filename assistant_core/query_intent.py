@@ -29,8 +29,12 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_emails = "correo" in q or "mail" in q or "email" in q
     asks_for_phones = "telefono" in q or "teléfono" in q or "numero" in q or "número" in q
     asks_for_owner_load = (
-        ("cuantos clientes" in q or "cuántos clientes" in q or "asignados" in q)
-        and ("vendedor" in q or "propietario" in q or "agente" in q)
+        ("cuantos clientes" in q or "cuántos clientes" in q or "asignados" in q or "carga" in q)
+        and ("vendedor" in q or "propietario" in q or "agente" in q or "clientes" in q)
+    ) or (
+        "quien tiene mas clientes asignados" in q
+        or "quién tiene más clientes asignados" in q
+        or "carga por vendedor" in q
     )
     asks_for_last_contact = "ultimo contacto" in q or "último contacto" in q or "ayer" in q or "antier" in q or "anteayer" in q
     asks_for_pending_commitments = "compromiso" in q or "pendiente" in q or "tarea" in q

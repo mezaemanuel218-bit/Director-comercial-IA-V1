@@ -511,7 +511,10 @@ class SalesAssistantService:
     def _format_owner_load(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "No encontre propietarios con registros."
-        return "\n".join(f"{row['owner_name']}: {row['total_records']}" for row in rows)
+        lines = [f"{row['owner_name']}: {row['total_records']}" for row in rows]
+        top = rows[0]
+        summary = f"Con mas clientes asignados: {top['owner_name']} ({top['total_records']})"
+        return summary + "\n\n" + "\n".join(lines)
 
     def _format_pending_tasks(self, rows: list[dict[str, Any]]) -> str:
         if not rows:

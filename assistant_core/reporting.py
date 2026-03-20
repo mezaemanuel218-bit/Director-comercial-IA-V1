@@ -79,6 +79,9 @@ def dashboard_metrics(owner: str | None = None, date_from: str | None = None, da
             task_filters.append("date(COALESCE(due_date, created_time)) <= date(?)")
             task_params.append(date_to)
 
+        if not status:
+            task_filters.append("(status IS NULL OR lower(status) NOT IN ('completed', 'cancelled'))")
+
         task_where = f"WHERE {' AND '.join(task_filters)}" if task_filters else ""
 
         pending_tasks = [
