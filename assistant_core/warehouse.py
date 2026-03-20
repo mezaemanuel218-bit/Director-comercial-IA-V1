@@ -556,3 +556,19 @@ def build_warehouse() -> BuildStats:
     conn.commit()
     conn.close()
     return stats
+
+
+def warehouse_counts() -> dict[str, int]:
+    WAREHOUSE_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(WAREHOUSE_DB)
+    cursor = conn.cursor()
+
+    counts: dict[str, int] = {}
+    for table in ("leads", "contacts", "notes", "calls", "tasks", "events", "interactions"):
+        try:
+            counts[table] = cursor.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        except sqlite3.OperationalError:
+            counts[table] = 0
+
+    conn.close()
+    return counts

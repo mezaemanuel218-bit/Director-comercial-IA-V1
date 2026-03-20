@@ -186,10 +186,11 @@ async function refreshData() {
     refreshOutput.innerHTML = `
       <strong>Módulos sincronizados:</strong> ${data.synced_modules.join(", ")}<br>
       <strong>Warehouse:</strong> leads ${data.warehouse.leads}, contacts ${data.warehouse.contacts}, notes ${data.warehouse.notes}, calls ${data.warehouse.calls}, tasks ${data.warehouse.tasks}, events ${data.warehouse.events}, interactions ${data.warehouse.interactions}<br>
-      <strong>Documentos indexados:</strong> ${data.indexed_documents}
+      <strong>Documentos indexados:</strong> ${data.indexed_documents}<br>
+      <strong>Última actualización:</strong> ${data.last_refresh || "sin dato"}
     `;
     setBanner("Actualización completada correctamente.");
-    await loadDashboard();
+    await Promise.all([loadDashboard(), loadOwners()]);
   } catch (error) {
     refreshOutput.textContent = "La actualización no se completó.";
     setBanner(error.message || "Ocurrió un error al refrescar.", true);
@@ -315,6 +316,10 @@ async function loadDashboard() {
       prioritiesData.items || [],
       "Sin prioridades calculadas."
     );
+
+    if (data.last_refresh) {
+      refreshOutput.innerHTML = `<strong>Última actualización conocida:</strong> ${data.last_refresh}`;
+    }
   } catch (error) {
     console.error(error);
   }

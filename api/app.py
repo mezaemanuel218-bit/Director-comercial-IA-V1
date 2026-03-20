@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -12,8 +13,9 @@ from assistant_core.config import PROJECT_ROOT
 from assistant_core.documents import index_documents
 from assistant_core.history import ensure_history_schema, fetch_history, save_history
 from assistant_core.reporting import available_owners, dashboard_metrics
+from assistant_core.runtime_state import get_runtime_value, set_runtime_value
 from assistant_core.service import SalesAssistantService
-from assistant_core.warehouse import build_warehouse
+from assistant_core.warehouse import build_warehouse, warehouse_counts
 from scripts.sync_zoho import run as sync_zoho
 
 
@@ -49,6 +51,25 @@ def prepare_local_state() -> None:
     build_warehouse()
     index_documents()
     ensure_history_schema()
+    _auto_refresh_if_empty()
+
+
+def _auto_refresh_if_empty() -> None:
+    counts = warehouse_counts()
+    if counts.get("leads", 0) > 0 or counts.get("contacts", 0) > 0:
+        return
+
+    required = ["ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN"]
+    if not all(os.getenv(key) for key in required):
+        return
+
+    try:
+        sync_zoho()
+        build_warehouse()
+        index_documents()
+        set_runtime_value("last_refresh", "startup_auto_refresh")
+    except Exception:
+        return
 
 
 class AskRequest(BaseModel):
@@ -77,6 +98,7 @@ class RefreshResponse(BaseModel):
     synced_modules: list[str]
     warehouse: dict[str, int]
     indexed_documents: int
+    last_refresh: str | None = None
 
 
 class HistoryItem(BaseModel):
@@ -97,6 +119,7 @@ class DashboardResponse(BaseModel):
     pending_tasks: list[dict]
     stale_contacts: list[dict]
     recent_activity: list[dict]
+    last_refresh: str | None = None
 
 
 class PriorityResponse(BaseModel):
@@ -180,6 +203,8 @@ def refresh(user: UserResponse = Depends(require_user)) -> RefreshResponse:
         sync_zoho()
         stats = build_warehouse()
         indexed_documents = index_documents()
+        set_runtime_value("last_refresh", "manual_refresh")
+        last_refresh = get_runtime_value("last_refresh")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -196,6 +221,7 @@ def refresh(user: UserResponse = Depends(require_user)) -> RefreshResponse:
             "interactions": stats.interactions,
         },
         indexed_documents=indexed_documents,
+        last_refresh=last_refresh["updated_at"] if last_refresh else None,
     )
 
 
@@ -218,9 +244,10 @@ def dashboard(
 ) -> DashboardResponse:
     try:
         data = dashboard_metrics(owner=owner, date_from=date_from, date_to=date_to, status=status)
+        last_refresh = get_runtime_value("last_refresh")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return DashboardResponse(**data)
+    return DashboardResponse(**data, last_refresh=last_refresh["updated_at"] if last_refresh else None)
 
 
 @app.get("/owners", response_model=list[str])
