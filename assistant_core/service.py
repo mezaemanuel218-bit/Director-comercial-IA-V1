@@ -209,9 +209,11 @@ class SalesAssistantService:
                 evidence["recent_interactions"] = self._recent_interactions_for_entity(conn, entity_term)
                 evidence["recent_notes"] = self._recent_notes_for_entity(conn, entity_term)
 
-            if intent.asks_for_emails and entity_term:
+            if intent.asks_for_contact_directory and entity_term:
+                evidence["direct_answer"] = self._contact_directory_for_entity(conn, entity_term)
+            elif intent.asks_for_emails and entity_term:
                 if intent.asks_for_names:
-                    evidence["direct_answer"] = self._contact_points_for_entity(conn, entity_term)
+                    evidence["direct_answer"] = self._contact_directory_for_entity(conn, entity_term)
                 else:
                     evidence["direct_answer"] = self._emails_for_entity(conn, entity_term)
             elif intent.asks_for_assigned_clients:
@@ -228,6 +230,19 @@ class SalesAssistantService:
             elif intent.asks_for_interactions_by_owner:
                 evidence["interactions_by_owner"] = self._interactions_by_owner(conn, owner_scope)
                 evidence["direct_answer"] = self._format_interactions_by_owner(evidence["interactions_by_owner"], owner_scope)
+            elif intent.asks_for_generic_relative_interactions:
+                if "antier" in question.lower() or "anteayer" in question.lower():
+                    evidence["relative_interactions"] = self._interactions_on_relative_day(conn, 2, owner_scope)
+                    evidence["direct_answer"] = self._format_interaction_list(
+                        evidence["relative_interactions"],
+                        "No encontre interacciones registradas antier.",
+                    )
+                else:
+                    evidence["relative_interactions"] = self._interactions_on_relative_day(conn, 1, owner_scope)
+                    evidence["direct_answer"] = self._format_interaction_list(
+                        evidence["relative_interactions"],
+                        "No encontre interacciones registradas ayer.",
+                    )
             elif intent.asks_for_recent_activity_by_owner:
                 evidence["recent_activity_by_owner"] = self._recent_activity_by_owner(conn, owner_scope)
                 evidence["direct_answer"] = self._format_recent_activity_by_owner(evidence["recent_activity_by_owner"], owner_scope)
@@ -274,8 +289,13 @@ class SalesAssistantService:
                 if intent.mode == "data":
                     evidence["direct_answer"] = self._format_last_interactions(evidence["last_interactions"])
             elif intent.asks_for_kpis:
-                evidence["owner_kpis"] = self._owner_kpis(conn, owner_scope)
-                evidence["direct_answer"] = self._format_owner_kpis(evidence["owner_kpis"], owner_scope)
+                window_days = 7 if intent.asks_for_weekly_window else None
+                if intent.asks_for_global_kpis or "de todos los vendedores" in question.lower():
+                    evidence["global_kpis"] = self._global_kpis(conn, window_days=window_days)
+                    evidence["direct_answer"] = self._format_global_kpis(evidence["global_kpis"], window_days=window_days)
+                else:
+                    evidence["owner_kpis"] = self._owner_kpis(conn, owner_scope, window_days=window_days)
+                    evidence["direct_answer"] = self._format_owner_kpis(evidence["owner_kpis"], owner_scope, window_days=window_days)
             elif intent.asks_for_risks and entity_term:
                 evidence["risk_profile"] = self._risk_profile(conn, entity_term)
                 evidence["direct_answer"] = self._format_risk_profile(evidence["risk_profile"], entity_term)
@@ -365,6 +385,8 @@ class SalesAssistantService:
 
     def _resolve_owner_scope_v2(self, question: str, user: AppUser | None) -> str | None:
         normalized = self._normalize_search_text(question)
+        if any(token in normalized for token in ["global", "todos los vendedores", "todos", "equipo"]):
+            return None
         aliases = {
             "eduardo": "Eduardo Valdez",
             "evaldez": "Eduardo Valdez",
@@ -535,6 +557,37 @@ class SalesAssistantService:
         rows = self._field_values_for_entity(conn, term, "phone")
         return "\n".join(rows) if rows else "No encontre telefonos para ese cliente o prospecto."
 
+    def _contact_directory_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        matches = self._entity_matches(conn, term)
+        notes = self._recent_notes_for_entity(conn, term)
+        lines: list[str] = []
+        seen: set[str] = set()
+
+        for match in matches:
+            label = match.get("contact_name") or match.get("full_name") or match.get("company_name") or "Sin nombre"
+            email = match.get("email") or "Sin correo"
+            phone = match.get("phone") or "Sin telefono"
+            key = f"{label}|{email}|{phone}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(
+                f"- {label} | Correo: {email} | Telefono: {phone} | Responsable CRM: {match.get('owner_name') or 'Sin responsable'}"
+            )
+
+        for contact in self._emails_from_notes(conn, term, include_names=True):
+            name, _, email = contact.partition(" | ")
+            normalized = email.replace("Contacto en nota | ", "").strip()
+            key = f"{name}|{normalized}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- {name} | Correo: {normalized} | Telefono: Sin telefono | Fuente: nota CRM")
+
+        if not lines:
+            return f"No hay evidencia disponible sobre contactos de {term} en la información proporcionada."
+        return f"Contactos de {term} disponibles:\n\n" + "\n".join(lines)
+
     def _field_values_for_entity(self, conn: sqlite3.Connection, term: str, field_name: str) -> list[str]:
         matches = self._entity_matches(conn, term)
         values = [match.get(field_name) for match in matches if match.get(field_name)]
@@ -673,20 +726,48 @@ class SalesAssistantService:
         query += " GROUP BY owner_name ORDER BY recent_interactions DESC, latest_activity DESC"
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 
-    def _owner_kpis(self, conn: sqlite3.Connection, owner_scope: str | None = None) -> dict[str, Any]:
-        lead_where = "WHERE owner_name = ?" if owner_scope else ""
-        contact_where = "WHERE owner_name = ?" if owner_scope else ""
-        interaction_where = "WHERE owner_name = ?" if owner_scope else ""
-        note_where = "WHERE owner_name = ?" if owner_scope else ""
-        params = [owner_scope] if owner_scope else []
+    def _owner_kpis(self, conn: sqlite3.Connection, owner_scope: str | None = None, window_days: int | None = None) -> dict[str, Any]:
+        lead_filters = []
+        contact_filters = []
+        note_filters = []
+        interaction_filters = []
+        task_filters = []
+        params: list[Any] = []
 
-        leads = conn.execute(f"SELECT COUNT(*) FROM leads {lead_where}", params).fetchone()[0]
-        contacts = conn.execute(f"SELECT COUNT(*) FROM contacts {contact_where}", params).fetchone()[0]
-        notes = conn.execute(f"SELECT COUNT(*) FROM notes {note_where}", params).fetchone()[0]
-        interactions = conn.execute(f"SELECT COUNT(*) FROM interactions {interaction_where}", params).fetchone()[0]
+        if owner_scope:
+            lead_filters.append("owner_name = ?")
+            contact_filters.append("owner_name = ?")
+            note_filters.append("owner_name = ?")
+            interaction_filters.append("owner_name = ?")
+            task_filters.append("owner_name = ?")
+            params.append(owner_scope)
+
+        if window_days:
+            lead_filters.append("date(COALESCE(modified_time, created_time)) >= date('now', ?)")
+            contact_filters.append("date(COALESCE(modified_time, created_time)) >= date('now', ?)")
+            note_filters.append("date(created_time) >= date('now', ?)")
+            interaction_filters.append("date(interaction_at) >= date('now', ?)")
+            task_filters.append("date(COALESCE(due_date, created_time)) >= date('now', ?)")
+            params.extend([f"-{window_days} day"] * 5)
+
+        lead_where = f"WHERE {' AND '.join(lead_filters)}" if lead_filters else ""
+        contact_where = f"WHERE {' AND '.join(contact_filters)}" if contact_filters else ""
+        note_where = f"WHERE {' AND '.join(note_filters)}" if note_filters else ""
+        interaction_where = f"WHERE {' AND '.join(interaction_filters)}" if interaction_filters else ""
+        task_where = f"WHERE {' AND '.join(task_filters)}" if task_filters else ""
+
+        split = 1 if owner_scope else 0
+        leads = conn.execute(f"SELECT COUNT(*) FROM leads {lead_where}", params[: split + (1 if window_days else 0)]).fetchone()[0]
+        contacts = conn.execute(f"SELECT COUNT(*) FROM contacts {contact_where}", params[: split + (1 if window_days else 0)]).fetchone()[0]
+        notes = conn.execute(f"SELECT COUNT(*) FROM notes {note_where}", params[: split + (1 if window_days else 0)]).fetchone()[0]
+        interactions = conn.execute(f"SELECT COUNT(*) FROM interactions {interaction_where}", params[: split + (1 if window_days else 0)]).fetchone()[0]
+        open_tasks = conn.execute(
+            f"SELECT COUNT(*) FROM tasks {task_where}{' AND ' if task_where else 'WHERE '}(status IS NULL OR lower(status) NOT IN ('completed', 'cancelled'))",
+            params[: split + (1 if window_days else 0)],
+        ).fetchone()[0]
         last_activity_row = conn.execute(
             f"SELECT MAX(interaction_at) FROM interactions {interaction_where}",
-            params,
+            params[: split + (1 if window_days else 0)],
         ).fetchone()
         return {
             "owner_scope": owner_scope,
@@ -694,8 +775,19 @@ class SalesAssistantService:
             "contacts": contacts,
             "notes": notes,
             "interactions": interactions,
+            "open_tasks": open_tasks,
             "last_activity": last_activity_row[0] if last_activity_row else None,
         }
+
+    def _global_kpis(self, conn: sqlite3.Connection, window_days: int | None = None) -> list[dict[str, Any]]:
+        owners = [row["owner_name"] for row in self._owner_load(conn)]
+        results: list[dict[str, Any]] = []
+        for owner_name in owners:
+            kpis = self._owner_kpis(conn, owner_name, window_days=window_days)
+            if any(kpis[key] for key in ("leads", "contacts", "notes", "interactions", "open_tasks")):
+                results.append({"owner_name": owner_name, **kpis})
+        results.sort(key=lambda item: (-(item["interactions"] + item["notes"] + item["contacts"] + item["leads"]), item["owner_name"]))
+        return results
 
     def _assigned_clients(self, conn: sqlite3.Connection, owner_scope: str | None = None) -> list[dict[str, Any]]:
         if not owner_scope:
@@ -1079,16 +1171,31 @@ class SalesAssistantService:
         )
         return "\n".join(lines)
 
-    def _format_owner_kpis(self, kpis: dict[str, Any], owner_scope: str | None = None) -> str:
+    def _format_owner_kpis(self, kpis: dict[str, Any], owner_scope: str | None = None, window_days: int | None = None) -> str:
         target = owner_scope or "todo el equipo"
+        period = f" de los ultimos {window_days} dias" if window_days else ""
         return (
-            f"KPIs de {target}:\n"
+            f"KPIs de {target}{period}:\n"
             f"- Leads: {kpis['leads']}\n"
             f"- Contacts: {kpis['contacts']}\n"
             f"- Notas: {kpis['notes']}\n"
             f"- Interacciones: {kpis['interactions']}\n"
+            f"- Pendientes abiertos: {kpis['open_tasks']}\n"
             f"- Ultima actividad registrada: {kpis['last_activity'] or 'sin dato'}"
         )
+
+    def _format_global_kpis(self, rows: list[dict[str, Any]], window_days: int | None = None) -> str:
+        if not rows:
+            return "No encontre KPIs globales para el periodo solicitado."
+        period = f" de la ultima semana" if window_days == 7 else ""
+        lines = [f"KPI global{period} de todos los vendedores:", ""]
+        for row in rows[:12]:
+            lines.append(
+                f"- {row['owner_name']} | Leads: {row['leads']} | Contacts: {row['contacts']} | "
+                f"Notas: {row['notes']} | Interacciones: {row['interactions']} | Pendientes: {row['open_tasks']} | "
+                f"Ultima actividad: {row['last_activity'] or 'sin dato'}"
+            )
+        return "\n".join(lines)
 
     def _format_assigned_clients(self, rows: list[dict[str, Any]], owner_scope: str | None = None) -> str:
         if not owner_scope:
