@@ -12,6 +12,8 @@ def _hash_password(password: str) -> str:
 class AppUser:
     username: str
     display_name: str
+    role: str
+    crm_owner_name: str | None
     password_hash: str
 
 
@@ -21,16 +23,22 @@ APP_USERS = {
     "evaldez": AppUser(
         username="evaldez",
         display_name="Eduardo Valdez",
+        role="ceo",
+        crm_owner_name="Eduardo Valdez",
         password_hash=DEFAULT_PASSWORD_HASH,
     ),
     "pmelin": AppUser(
         username="pmelin",
         display_name="Pablo Melin",
+        role="seller",
+        crm_owner_name="Pablo Melin Dorador",
         password_hash=DEFAULT_PASSWORD_HASH,
     ),
     "emeza": AppUser(
         username="emeza",
         display_name="Emmanuel Meza",
+        role="seller",
+        crm_owner_name="Jesus Emmanuel Meza Guzmán",
         password_hash=DEFAULT_PASSWORD_HASH,
     ),
 }

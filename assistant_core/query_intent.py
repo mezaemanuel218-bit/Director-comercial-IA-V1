@@ -13,6 +13,10 @@ class QuestionIntent:
     asks_for_names: bool
     asks_for_phones: bool
     asks_for_owner_load: bool
+    asks_for_interactions_by_owner: bool
+    asks_for_recent_activity_by_owner: bool
+    asks_for_risks: bool
+    asks_for_kpis: bool
     asks_for_last_contact: bool
     asks_for_pending_commitments: bool
     asks_for_stale_contacts: bool
@@ -37,7 +41,13 @@ def classify_question(question: str) -> QuestionIntent:
         "quien tiene mas clientes asignados" in q
         or "quién tiene más clientes asignados" in q
         or "carga por vendedor" in q
+        or "quien tiene mas prospectos asignados" in q
+        or "quién tiene más prospectos asignados" in q
     )
+    asks_for_interactions_by_owner = "interacciones" in q and ("vendedor" in q or "agente" in q or "propietario" in q or "cada" in q)
+    asks_for_recent_activity_by_owner = ("actividad reciente" in q or "mas actividad reciente" in q or "más actividad reciente" in q) and ("quien" in q or "quién" in q or "vendedor" in q)
+    asks_for_risks = "riesgo" in q or "riesgos" in q
+    asks_for_kpis = "kpi" in q or "kpis" in q or ("metric" in q and ("nota" in q or "cliente" in q))
     asks_for_last_contact = "ultimo contacto" in q or "último contacto" in q or "ayer" in q or "antier" in q or "anteayer" in q
     asks_for_pending_commitments = "compromiso" in q or "pendiente" in q or "tarea" in q
     asks_for_stale_contacts = "30 dias" in q or "30 días" in q or "sin contacto" in q
@@ -64,6 +74,8 @@ def classify_question(question: str) -> QuestionIntent:
         "conviene",
         "analiza",
         "compar",
+        "riesgo",
+        "riesgos",
     ]
     data_signals = [
         "solo",
@@ -94,6 +106,10 @@ def classify_question(question: str) -> QuestionIntent:
         asks_for_names=asks_for_names,
         asks_for_phones=asks_for_phones,
         asks_for_owner_load=asks_for_owner_load,
+        asks_for_interactions_by_owner=asks_for_interactions_by_owner,
+        asks_for_recent_activity_by_owner=asks_for_recent_activity_by_owner,
+        asks_for_risks=asks_for_risks,
+        asks_for_kpis=asks_for_kpis,
         asks_for_last_contact=asks_for_last_contact,
         asks_for_pending_commitments=asks_for_pending_commitments,
         asks_for_stale_contacts=asks_for_stale_contacts,

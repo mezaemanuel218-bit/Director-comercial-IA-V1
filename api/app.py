@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 
-from assistant_core.auth import authenticate_user, get_user, session_secret_key
+from assistant_core.auth import AppUser, authenticate_user, get_user, session_secret_key
 from assistant_core.config import PROJECT_ROOT
 from assistant_core.documents import index_documents
 from assistant_core.history import ensure_history_schema, fetch_history, save_history
@@ -158,14 +158,25 @@ class PriorityResponse(BaseModel):
 class UserResponse(BaseModel):
     username: str
     display_name: str
+    role: str
+    crm_owner_name: str | None = None
 
 
-def require_user(request: Request) -> UserResponse:
+def _to_user_response(user: AppUser) -> UserResponse:
+    return UserResponse(
+        username=user.username,
+        display_name=user.display_name,
+        role=user.role,
+        crm_owner_name=user.crm_owner_name,
+    )
+
+
+def require_user(request: Request) -> AppUser:
     session_user = request.session.get("username")
     user = get_user(session_user)
     if not user:
         raise HTTPException(status_code=401, detail="Sesión requerida.")
-    return UserResponse(username=user.username, display_name=user.display_name)
+    return user
 
 
 @app.get("/", include_in_schema=False)
@@ -189,7 +200,7 @@ def login(payload: LoginRequest, request: Request) -> UserResponse:
     if not user:
         raise HTTPException(status_code=401, detail="Usuario o contraseña inválidos.")
     request.session["username"] = user.username
-    return UserResponse(username=user.username, display_name=user.display_name)
+    return _to_user_response(user)
 
 
 @app.post("/logout")
@@ -199,14 +210,14 @@ def logout(request: Request) -> dict[str, str]:
 
 
 @app.get("/me", response_model=UserResponse)
-def me(user: UserResponse = Depends(require_user)) -> UserResponse:
-    return user
+def me(user: AppUser = Depends(require_user)) -> UserResponse:
+    return _to_user_response(user)
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(payload: AskRequest, user: UserResponse = Depends(require_user)) -> AskResponse:
+def ask(payload: AskRequest, user: AppUser = Depends(require_user)) -> AskResponse:
     try:
-        result = assistant_service.answer_question(payload.question)
+        result = assistant_service.answer_question(payload.question, user=user)
         save_history(
             question=payload.question,
             answer=result.answer,
@@ -226,7 +237,7 @@ def ask(payload: AskRequest, user: UserResponse = Depends(require_user)) -> AskR
 
 
 @app.post("/refresh", response_model=RefreshResponse)
-def refresh(user: UserResponse = Depends(require_user)) -> RefreshResponse:
+def refresh(user: AppUser = Depends(require_user)) -> RefreshResponse:
     cooldown_seconds = _refresh_cooldown_remaining_seconds()
     if cooldown_seconds > 0:
         counts = warehouse_counts()
