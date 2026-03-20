@@ -54,6 +54,15 @@ def prepare_local_state() -> None:
     build_warehouse()
     index_documents()
     ensure_history_schema()
+    ensure_runtime_schema()
+    counts = warehouse_counts()
+    has_snapshot = counts.get("leads", 0) > 0 or counts.get("contacts", 0) > 0
+    existing_refresh = get_runtime_value("last_refresh")
+    existing_status = get_runtime_value("last_refresh_status")
+    if has_snapshot and not existing_refresh:
+        set_runtime_value("last_refresh", "startup_snapshot")
+    if has_snapshot and not existing_status:
+        set_runtime_value("last_refresh_status", "snapshot_only")
 
 
 def _utcnow() -> datetime:

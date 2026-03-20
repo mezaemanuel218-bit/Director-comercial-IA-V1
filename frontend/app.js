@@ -33,10 +33,40 @@ const staleContactsList = document.getElementById("staleContactsList");
 const recentActivityList = document.getElementById("recentActivityList");
 const historyList = document.getElementById("historyList");
 const prioritiesTable = document.getElementById("prioritiesTable");
+let refreshCooldownTimer = null;
 
 function formatCooldown(seconds) {
   if (!seconds || seconds <= 0) return "";
   return `${Math.ceil(seconds / 60)} min`;
+}
+
+function applyRefreshCooldown(seconds) {
+  if (refreshCooldownTimer) {
+    clearInterval(refreshCooldownTimer);
+    refreshCooldownTimer = null;
+  }
+
+  if (!seconds || seconds <= 0) {
+    refreshButton.disabled = false;
+    refreshButton.textContent = "Actualizar Zoho ahora";
+    return;
+  }
+
+  let remaining = seconds;
+  refreshButton.disabled = true;
+  refreshButton.textContent = `Disponible en ${formatCooldown(remaining)}`;
+
+  refreshCooldownTimer = setInterval(() => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearInterval(refreshCooldownTimer);
+      refreshCooldownTimer = null;
+      refreshButton.disabled = false;
+      refreshButton.textContent = "Actualizar Zoho ahora";
+      return;
+    }
+    refreshButton.textContent = `Disponible en ${formatCooldown(remaining)}`;
+  }, 1000);
 }
 
 async function readJsonSafely(response) {
@@ -209,13 +239,15 @@ async function refreshData() {
       <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.cooldown_seconds ? `<br><strong>Proxima sincronizacion manual:</strong> ${formatCooldown(data.cooldown_seconds)}` : ""}
     `;
     setBanner(data.warning || "Actualizacion completada correctamente.");
+    applyRefreshCooldown(data.cooldown_seconds || 0);
     await Promise.all([loadDashboard(), loadOwners()]);
   } catch (error) {
     refreshOutput.textContent = "La actualizacion no se completo.";
     setBanner(error.message || "Ocurrio un error al refrescar.", true);
   } finally {
-    refreshButton.disabled = false;
-    refreshButton.textContent = "Actualizar Zoho ahora";
+    if (!refreshButton.disabled) {
+      refreshButton.textContent = "Actualizar Zoho ahora";
+    }
   }
 }
 
@@ -342,6 +374,7 @@ async function loadDashboard() {
         <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.cooldown_seconds ? `<br><strong>Proxima sincronizacion manual:</strong> ${formatCooldown(data.cooldown_seconds)}` : ""}${data.warning ? `<br><strong>Estado:</strong> ${data.warning}` : ""}
       `;
     }
+    applyRefreshCooldown(data.cooldown_seconds || 0);
   } catch (error) {
     console.error(error);
   }
