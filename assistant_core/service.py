@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 import unicodedata
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,8 +10,9 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from assistant_core.auth import AppUser
-from assistant_core.config import WAREHOUSE_DB
+from assistant_core.config import RAW_MODULE_FILES, WAREHOUSE_DB
 from assistant_core.query_intent import QuestionIntent, classify_question
+from assistant_core.utils import load_json, strip_html
 
 
 load_dotenv()
@@ -211,10 +213,11 @@ class SalesAssistantService:
 
             if entity_term and (
                 intent.asks_for_contact_directory
-                or (intent.asks_for_names and intent.asks_for_emails)
                 or (intent.asks_for_names and intent.asks_for_phones)
             ):
                 evidence["direct_answer"] = self._contact_directory_for_entity(conn, entity_term)
+            elif entity_term and intent.asks_for_names and intent.asks_for_emails:
+                evidence["direct_answer"] = self._contact_points_for_entity(conn, entity_term)
             elif intent.asks_for_emails and entity_term:
                 evidence["direct_answer"] = self._emails_for_entity(conn, entity_term)
             elif intent.asks_for_assigned_clients:
@@ -1323,6 +1326,341 @@ class SalesAssistantService:
             return [dict(row) for row in conn.execute(query, values).fetchall()]
         except sqlite3.OperationalError:
             return []
+
+    def _raw_module_rows(self, module: str) -> list[dict[str, Any]]:
+        cache_name = f"_cache_{module}"
+        cached = getattr(self, cache_name, None)
+        if cached is None:
+            cached = load_json(RAW_MODULE_FILES[module])
+            setattr(self, cache_name, cached)
+        return cached
+
+    def _owner_key(self, owner_name: str | None) -> str:
+        return self._normalize_search_text(owner_name or "")
+
+    def _owner_matches(self, candidate: str | None, owner_scope: str | None) -> bool:
+        if not owner_scope:
+            return True
+        return self._owner_key(candidate) == self._owner_key(owner_scope)
+
+    def _parse_datetime_safe(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        candidate = str(value).strip()
+        if not candidate:
+            return None
+        try:
+            return datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def _within_window(self, value: str | None, window_days: int | None) -> bool:
+        if not window_days:
+            return True
+        parsed = self._parse_datetime_safe(value)
+        if not parsed:
+            return False
+        return parsed.date() >= (datetime.now(parsed.tzinfo).date() - timedelta(days=window_days))
+
+    def _matches_entity_snapshot(self, payload: dict[str, Any], term: str) -> bool:
+        normalized_term = self._normalize_search_text(self._clean_search_term(term))
+        fields = [
+            payload.get("Empresa"),
+            payload.get("Nombre_contacto"),
+            payload.get("Full_Name"),
+            payload.get("Last_Name"),
+            ((payload.get("Account_Name") or {}) if isinstance(payload.get("Account_Name"), dict) else {}).get("name"),
+            payload.get("Email"),
+            payload.get("Phone"),
+        ]
+        haystack = self._normalize_search_text(" ".join(str(item or "") for item in fields))
+        return bool(normalized_term and normalized_term in haystack)
+
+    def _snapshot_contact_directory(self, term: str) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for module in ("leads", "contacts"):
+            for payload in self._raw_module_rows(module):
+                if not self._matches_entity_snapshot(payload, term):
+                    continue
+                owner = payload.get("Owner") or {}
+                if not isinstance(owner, dict):
+                    owner = {}
+                label = payload.get("Nombre_contacto") or payload.get("Full_Name") or payload.get("Empresa") or payload.get("Last_Name") or "Sin nombre"
+                company = payload.get("Empresa") or ((payload.get("Account_Name") or {}) if isinstance(payload.get("Account_Name"), dict) else {}).get("name")
+                email = payload.get("Email") or "Sin correo"
+                phone = payload.get("Phone") or payload.get("Mobile") or "Sin telefono"
+                key = f"{self._normalize_search_text(label)}|{str(email).lower()}|{phone}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(
+                    {
+                        "label": label,
+                        "company": company or "",
+                        "email": email,
+                        "phone": phone,
+                        "owner_name": owner.get("name") or "Sin responsable",
+                        "source": module,
+                    }
+                )
+
+        for payload in self._raw_module_rows("notes"):
+            parent = payload.get("Parent_Id") or {}
+            parent_name = parent.get("name") if isinstance(parent, dict) else ""
+            content = strip_html(payload.get("Note_Content"))
+            if not self._matches_entity_snapshot({"Empresa": parent_name, "Full_Name": parent_name, "Email": content}, term):
+                continue
+            emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", content)
+            for email in emails:
+                clean_email = email.strip().strip(".,;:()[]<>").lower()
+                name = self._guess_contact_name_from_note_v2(content, clean_email) or "Contacto en nota"
+                key = f"{self._normalize_search_text(name)}|{clean_email}|Sin telefono"
+                if key in seen:
+                    continue
+                seen.add(key)
+                owner = payload.get("Owner") or {}
+                if not isinstance(owner, dict):
+                    owner = {}
+                rows.append(
+                    {
+                        "label": name,
+                        "company": parent_name or "",
+                        "email": clean_email,
+                        "phone": "Sin telefono",
+                        "owner_name": owner.get("name") or "Sin responsable",
+                        "source": "nota CRM",
+                    }
+                )
+        return rows
+
+    def _contact_directory_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        snapshot_rows = self._snapshot_contact_directory(term)
+        if snapshot_rows:
+            lines = []
+            for row in snapshot_rows:
+                suffix = f" | Empresa: {row['company']}" if row.get("company") else ""
+                source = f" | Fuente: {row['source']}" if row.get("source") == "nota CRM" else ""
+                lines.append(
+                    f"- {row['label']} | Correo: {row['email']} | Telefono: {row['phone']} | Responsable CRM: {row['owner_name']}{suffix}{source}"
+                )
+            return f"Contactos de {term} disponibles:\n\n" + "\n".join(lines)
+        return f"No hay evidencia disponible sobre contactos de {term} en la informacion proporcionada."
+
+    def _emails_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        snapshot_rows = self._snapshot_contact_directory(term)
+        emails = sorted({row["email"] for row in snapshot_rows if row.get("email") and row["email"] != "Sin correo"})
+        return "\n".join(emails) if emails else "No encontre correos para ese cliente o prospecto."
+
+    def _contact_points_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        snapshot_rows = self._snapshot_contact_directory(term)
+        lines = []
+        seen: set[str] = set()
+        for row in snapshot_rows:
+            email = row.get("email")
+            if not email or email == "Sin correo":
+                continue
+            key = f"{self._normalize_search_text(row['label'])}|{email.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- {row['label']} | {email}")
+        return "\n".join(lines) if lines else "No encontre nombres y correos para ese cliente o prospecto."
+
+    def _phones_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
+        snapshot_rows = self._snapshot_contact_directory(term)
+        lines = []
+        for row in snapshot_rows:
+            if not row.get("phone") or row["phone"] == "Sin telefono":
+                continue
+            lines.append(f"{row['label']} | {row['phone']}")
+        unique_lines = list(dict.fromkeys(lines))
+        return "\n".join(unique_lines) if unique_lines else "No encontre telefonos para ese cliente o prospecto."
+
+    def _assigned_clients(self, conn: sqlite3.Connection, owner_scope: str | None = None) -> list[dict[str, Any]]:
+        if not owner_scope:
+            return []
+        rows: list[dict[str, Any]] = []
+        for module in ("leads", "contacts"):
+            for payload in self._raw_module_rows(module):
+                owner = payload.get("Owner") or {}
+                if not isinstance(owner, dict) or not self._owner_matches(owner.get("name"), owner_scope):
+                    continue
+                rows.append(
+                    {
+                        "entity_type": "lead" if module == "leads" else "contact",
+                        "company_name": payload.get("Empresa") or ((payload.get("Account_Name") or {}) if isinstance(payload.get("Account_Name"), dict) else {}).get("name"),
+                        "contact_name": payload.get("Nombre_contacto"),
+                        "full_name": payload.get("Full_Name") or payload.get("Last_Name"),
+                        "email": payload.get("Email"),
+                        "phone": payload.get("Phone") or payload.get("Mobile"),
+                        "owner_name": owner.get("name"),
+                        "last_activity_time": payload.get("Last_Activity_Time") or payload.get("Modified_Time") or payload.get("Created_Time"),
+                    }
+                )
+        rows.sort(key=lambda item: item.get("last_activity_time") or "", reverse=True)
+        return rows[:50]
+
+    def _interactions_on_relative_day(self, conn: sqlite3.Connection, days_ago: int, owner_scope: str | None = None) -> list[dict[str, Any]]:
+        target_date = datetime.now().date() - timedelta(days=days_ago)
+        rows: list[dict[str, Any]] = []
+
+        for payload in self._raw_module_rows("notes"):
+            owner = payload.get("Owner") or {}
+            created_time = payload.get("Created_Time")
+            parsed = self._parse_datetime_safe(created_time)
+            if not parsed or parsed.date() != target_date:
+                continue
+            if not isinstance(owner, dict) or not self._owner_matches(owner.get("name"), owner_scope):
+                continue
+            parent = payload.get("Parent_Id") or {}
+            rows.append(
+                {
+                    "related_name": parent.get("name") if isinstance(parent, dict) else "Sin nombre",
+                    "owner_name": owner.get("name") or "Sin responsable",
+                    "source_type": "note",
+                    "interaction_at": created_time,
+                    "status": None,
+                    "summary": strip_html(payload.get("Note_Content"))[:180],
+                }
+            )
+
+        for payload in self._raw_module_rows("calls"):
+            owner = payload.get("Owner") or {}
+            start_time = payload.get("Call_Start_Time") or payload.get("Created_Time")
+            parsed = self._parse_datetime_safe(start_time)
+            if not parsed or parsed.date() != target_date:
+                continue
+            if not isinstance(owner, dict) or not self._owner_matches(owner.get("name"), owner_scope):
+                continue
+            who = payload.get("Who_Id") or {}
+            rows.append(
+                {
+                    "related_name": who.get("name") if isinstance(who, dict) else "Sin nombre",
+                    "owner_name": owner.get("name") or "Sin responsable",
+                    "source_type": "call",
+                    "interaction_at": start_time,
+                    "status": payload.get("Call_Status"),
+                    "summary": payload.get("Subject") or "",
+                }
+            )
+
+        rows.sort(key=lambda item: item.get("interaction_at") or "", reverse=True)
+        return rows[:25]
+
+    def _interactions_by_owner(self, conn: sqlite3.Connection, owner_scope: str | None = None) -> list[dict[str, Any]]:
+        counters: dict[str, int] = {}
+        for module, time_key in (("notes", "Created_Time"), ("calls", "Call_Start_Time"), ("events", "Created_Time")):
+            for payload in self._raw_module_rows(module):
+                owner = payload.get("Owner") or {}
+                if not isinstance(owner, dict):
+                    continue
+                owner_name = owner.get("name")
+                if not owner_name or not self._owner_matches(owner_name, owner_scope):
+                    continue
+                counters[owner_name] = counters.get(owner_name, 0) + 1
+        rows = [{"owner_name": name, "total_interactions": total} for name, total in counters.items()]
+        rows.sort(key=lambda item: (-item["total_interactions"], item["owner_name"]))
+        return rows
+
+    def _recent_activity_by_owner(self, conn: sqlite3.Connection, owner_scope: str | None = None) -> list[dict[str, Any]]:
+        since = datetime.now().date() - timedelta(days=30)
+        stats: dict[str, dict[str, Any]] = {}
+        for module, time_key in (("notes", "Created_Time"), ("calls", "Call_Start_Time"), ("events", "Created_Time")):
+            for payload in self._raw_module_rows(module):
+                owner = payload.get("Owner") or {}
+                if not isinstance(owner, dict):
+                    continue
+                owner_name = owner.get("name")
+                parsed = self._parse_datetime_safe(payload.get(time_key))
+                if not owner_name or not parsed or parsed.date() < since:
+                    continue
+                if not self._owner_matches(owner_name, owner_scope):
+                    continue
+                entry = stats.setdefault(owner_name, {"owner_name": owner_name, "recent_interactions": 0, "latest_activity": None})
+                entry["recent_interactions"] += 1
+                latest = entry["latest_activity"]
+                if latest is None or (payload.get(time_key) or "") > latest:
+                    entry["latest_activity"] = payload.get(time_key)
+        rows = list(stats.values())
+        rows.sort(key=lambda item: (-item["recent_interactions"], item["latest_activity"] or ""))
+        return rows
+
+    def _owner_kpis(self, conn: sqlite3.Connection, owner_scope: str | None = None, window_days: int | None = None) -> dict[str, Any]:
+        def count_people(module: str) -> int:
+            total = 0
+            for payload in self._raw_module_rows(module):
+                owner = payload.get("Owner") or {}
+                if not isinstance(owner, dict) or not self._owner_matches(owner.get("name"), owner_scope):
+                    continue
+                activity_time = payload.get("Modified_Time") or payload.get("Created_Time") or payload.get("Last_Activity_Time")
+                if not self._within_window(activity_time, window_days):
+                    continue
+                total += 1
+            return total
+
+        def count_activity(module: str, time_key: str) -> tuple[int, str | None]:
+            total = 0
+            last_seen: str | None = None
+            for payload in self._raw_module_rows(module):
+                owner = payload.get("Owner") or {}
+                if not isinstance(owner, dict) or not self._owner_matches(owner.get("name"), owner_scope):
+                    continue
+                activity_time = payload.get(time_key)
+                if not self._within_window(activity_time, window_days):
+                    continue
+                total += 1
+                if activity_time and (last_seen is None or activity_time > last_seen):
+                    last_seen = activity_time
+            return total, last_seen
+
+        leads = count_people("leads")
+        contacts = count_people("contacts")
+        notes, notes_last = count_activity("notes", "Created_Time")
+        calls, calls_last = count_activity("calls", "Call_Start_Time")
+        events, events_last = count_activity("events", "Created_Time")
+
+        open_tasks = 0
+        task_last: str | None = None
+        for payload in self._raw_module_rows("tasks"):
+            owner = payload.get("Owner") or {}
+            if not isinstance(owner, dict) or not self._owner_matches(owner.get("name"), owner_scope):
+                continue
+            status = (payload.get("Status") or "").lower()
+            if status in {"completed", "cancelled"}:
+                continue
+            activity_time = payload.get("Due_Date") or payload.get("Created_Time") or payload.get("Modified_Time")
+            if not self._within_window(activity_time, window_days):
+                continue
+            open_tasks += 1
+            if activity_time and (task_last is None or activity_time > task_last):
+                task_last = activity_time
+
+        all_last = [value for value in (notes_last, calls_last, events_last, task_last) if value]
+        return {
+            "owner_scope": owner_scope,
+            "leads": leads,
+            "contacts": contacts,
+            "notes": notes,
+            "interactions": notes + calls + events,
+            "open_tasks": open_tasks,
+            "last_activity": max(all_last) if all_last else None,
+        }
+
+    def _global_kpis(self, conn: sqlite3.Connection, window_days: int | None = None) -> list[dict[str, Any]]:
+        owners: set[str] = set()
+        for module in ("leads", "contacts", "notes", "calls", "tasks", "events"):
+            for payload in self._raw_module_rows(module):
+                owner = payload.get("Owner") or {}
+                if isinstance(owner, dict) and owner.get("name"):
+                    owners.add(owner.get("name"))
+        rows: list[dict[str, Any]] = []
+        for owner_name in sorted(owners):
+            kpis = self._owner_kpis(conn, owner_name, window_days=window_days)
+            if any(kpis[key] for key in ("leads", "contacts", "notes", "interactions", "open_tasks")):
+                rows.append({"owner_name": owner_name, **kpis})
+        rows.sort(key=lambda item: (-(item["interactions"] + item["notes"] + item["contacts"] + item["leads"]), item["owner_name"]))
+        return rows
 
     def _owner_scope_from_question(self, question: str) -> str | None:
         normalized = self._normalize_search_text(question)
