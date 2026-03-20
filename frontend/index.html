@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Director Comercial IA</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="loginOverlay" class="login-overlay">
+    <div class="login-card">
+      <p class="eyebrow">Acceso</p>
+      <h2>Ingresa a Director Comercial IA</h2>
+      <p class="login-copy">
+        Acceso privado para el equipo comercial de Flotimatics.
+      </p>
+      <label>
+        <span>Usuario</span>
+        <input id="loginUsername" type="text" placeholder="evaldez, pmelin o emeza">
+      </label>
+      <label>
+        <span>Contraseña</span>
+        <input id="loginPassword" type="password" placeholder="Tu contraseña">
+      </label>
+      <button id="loginButton" class="primary-button login-button">Entrar</button>
+      <div id="loginMessage" class="login-message"></div>
+    </div>
+  </div>
+
+  <div class="page-shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Flotimatics Sales Intelligence</p>
+        <h1>Director Comercial IA</h1>
+        <p class="hero-text">
+          Asistente comercial conectado a Zoho y a tus documentos internos.
+          Haz preguntas operativas, pide estrategia y refresca la información cuando lo necesites.
+        </p>
+      </div>
+      <div class="hero-panel">
+        <div class="status-card">
+          <span class="status-label">Estado API</span>
+          <strong id="healthStatus">Verificando...</strong>
+          <p id="healthDetail">Conectando con el backend local.</p>
+        </div>
+        <div class="status-card accent">
+          <span class="status-label">Fuentes</span>
+          <strong>Zoho + PDFs</strong>
+          <p>La web solo debe usarse cuando se indique o se declare explícitamente.</p>
+        </div>
+        <div class="status-card">
+          <span class="status-label">Sesión</span>
+          <strong id="sessionUser">Sin sesión</strong>
+          <p id="sessionDetail">Inicia sesión para usar la plataforma.</p>
+          <button id="logoutButton" class="secondary-button inline-button hidden">Cerrar sesión</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="control-panel">
+        <div class="panel-head">
+          <div>
+            <p class="panel-kicker">Consulta</p>
+            <h2>Pregúntale al asistente</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="refreshButton" class="secondary-button">Actualizar Zoho ahora</button>
+            <button id="askButton" class="primary-button">Preguntar</button>
+          </div>
+        </div>
+
+        <label class="input-label" for="questionInput">Escribe tu pregunta</label>
+        <textarea id="questionInput" placeholder="Ejemplo: a quién debo llamar hoy y por qué"></textarea>
+
+        <div class="sample-block">
+          <span>Ideas rápidas</span>
+          <div class="sample-grid">
+            <button class="sample-chip" data-question="dame los correos de Hieleria Veracruz">Correos de un cliente</button>
+            <button class="sample-chip" data-question="a quien le hable ayer">Interacciones de ayer</button>
+            <button class="sample-chip" data-question="dame compromisos pendientes para hoy">Pendientes de hoy</button>
+            <button class="sample-chip" data-question="quien tiene mas clientes asignados">Carga por vendedor</button>
+            <button class="sample-chip" data-question="a quien debo llamar hoy y por que">Siguiente llamada</button>
+            <button class="sample-chip" data-question="compara Hieleria Veracruz vs Servicios y Minas de México Actus">Comparativa comercial</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="response-panel">
+        <div class="response-head">
+          <div>
+            <p class="panel-kicker">Respuesta</p>
+            <h2>Resultado del asistente</h2>
+          </div>
+          <div class="meta-pills">
+            <span class="meta-pill" id="modePill">Modo: -</span>
+            <span class="meta-pill" id="sourcePill">Fuentes: -</span>
+            <span class="meta-pill" id="webPill">Web: no</span>
+          </div>
+        </div>
+
+        <div id="feedbackBanner" class="feedback-banner hidden"></div>
+        <pre id="answerOutput" class="answer-output">Aquí aparecerá la respuesta.</pre>
+
+        <div class="refresh-summary">
+          <h3>Última actualización manual</h3>
+          <div id="refreshOutput">Todavía no se ha ejecutado una actualización desde la interfaz.</div>
+        </div>
+      </section>
+    </main>
+
+    <section class="analytics-grid">
+      <section class="dashboard-panel">
+        <div class="response-head">
+          <div>
+            <p class="panel-kicker">Dashboard</p>
+            <h2>Métricas comerciales</h2>
+          </div>
+        </div>
+
+        <div class="filters-grid">
+          <label>
+            <span>Vendedor</span>
+            <select id="ownerFilter">
+              <option value="">Todos</option>
+            </select>
+          </label>
+          <label>
+            <span>Fecha inicio</span>
+            <input id="dateFromFilter" type="date">
+          </label>
+          <label>
+            <span>Fecha fin</span>
+            <input id="dateToFilter" type="date">
+          </label>
+          <label>
+            <span>Estatus tarea</span>
+            <input id="statusFilter" type="text" placeholder="Completed, Scheduled, etc.">
+          </label>
+        </div>
+
+        <div class="panel-actions compact">
+          <button id="applyFiltersButton" class="secondary-button">Aplicar filtros</button>
+          <button id="clearFiltersButton" class="secondary-button">Limpiar</button>
+        </div>
+
+        <div class="stats-strip">
+          <div class="mini-stat">
+            <span>Total interacciones</span>
+            <strong id="totalInteractions">-</strong>
+          </div>
+          <div class="mini-stat">
+            <span>Tipos de actividad</span>
+            <strong id="activityTypes">-</strong>
+          </div>
+          <div class="mini-stat">
+            <span>Compromisos visibles</span>
+            <strong id="pendingCount">-</strong>
+          </div>
+          <div class="mini-stat">
+            <span>Clientes rezagados</span>
+            <strong id="staleCount">-</strong>
+          </div>
+        </div>
+
+        <div class="dashboard-card full-span">
+          <h3>Prioridades de seguimiento</h3>
+          <div id="prioritiesTable" class="table-output">Sin prioridades calculadas.</div>
+        </div>
+
+        <div class="dashboard-columns">
+          <div class="dashboard-card">
+            <h3>Carga por vendedor</h3>
+            <div id="ownerLoadList" class="list-output">Sin datos.</div>
+          </div>
+          <div class="dashboard-card">
+            <h3>Compromisos y tareas</h3>
+            <div id="pendingTasksList" class="list-output">Sin datos.</div>
+          </div>
+          <div class="dashboard-card">
+            <h3>Clientes sin contacto</h3>
+            <div id="staleContactsList" class="list-output">Sin datos.</div>
+          </div>
+          <div class="dashboard-card">
+            <h3>Actividad reciente</h3>
+            <div id="recentActivityList" class="table-output">Sin datos.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="history-panel">
+        <div class="response-head">
+          <div>
+            <p class="panel-kicker">Historial</p>
+            <h2>Conversaciones recientes</h2>
+          </div>
+        </div>
+        <div id="historyList" class="history-list">Todavía no hay preguntas registradas.</div>
+      </section>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

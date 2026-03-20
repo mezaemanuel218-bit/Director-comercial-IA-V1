@@ -1,0 +1,72 @@
+import sqlite3
+from datetime import datetime
+from typing import Any
+
+from assistant_core.config import WAREHOUSE_DB
+
+
+HISTORY_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS conversation_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        mode TEXT,
+        sources TEXT,
+        used_web INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_conversation_history_created_at
+    ON conversation_history(created_at DESC)
+    """,
+]
+
+
+def ensure_history_schema() -> None:
+    conn = sqlite3.connect(WAREHOUSE_DB)
+    cursor = conn.cursor()
+    for statement in HISTORY_SCHEMA:
+        cursor.execute(statement)
+    conn.commit()
+    conn.close()
+
+
+def save_history(question: str, answer: str, mode: str, sources: list[str], used_web: bool) -> None:
+    ensure_history_schema()
+    conn = sqlite3.connect(WAREHOUSE_DB)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO conversation_history(question, answer, mode, sources, used_web, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            question,
+            answer,
+            mode,
+            ", ".join(sources),
+            1 if used_web else 0,
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_history(limit: int = 20) -> list[dict[str, Any]]:
+    ensure_history_schema()
+    conn = sqlite3.connect(WAREHOUSE_DB)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT id, question, answer, mode, sources, used_web, created_at
+        FROM conversation_history
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]

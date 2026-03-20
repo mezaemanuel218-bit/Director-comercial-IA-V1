@@ -1,0 +1,9 @@
+openai
+python-dotenv
+requests
+numpy
+pymupdf
+pypdf
+sqlalchemy
+fastapi
+uvicorn

@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: director-comercial-ia
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
