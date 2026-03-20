@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,7 +33,7 @@ class SalesAssistantService:
         intent = classify_question(question)
         evidence = self._collect_evidence(question, intent)
 
-        if intent.mode == "data" and evidence.get("direct_answer"):
+        if evidence.get("direct_answer") and intent.mode in {"data", "analysis"}:
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
@@ -241,6 +242,7 @@ class SalesAssistantService:
                     evidence["direct_answer"] = self._format_today_call_list(evidence["today_call_list"])
             elif intent.asks_for_comparison:
                 evidence["comparison_candidates"] = self._comparison_candidates(conn, question)
+                evidence["direct_answer"] = self._format_comparison_candidates(evidence["comparison_candidates"])
             elif intent.asks_for_last_contact:
                 evidence["last_interactions"] = self._last_interactions(conn, entity_term)
                 if intent.mode == "data":
@@ -263,26 +265,67 @@ class SalesAssistantService:
         for prefix in prefixes:
             position = lower_question.find(prefix)
             if position >= 0:
-                return question[position + len(prefix):].strip(" ?.")
+                return self._clean_search_term(question[position + len(prefix):].strip(" ?."))
         return None
 
     def _entity_matches(self, conn: sqlite3.Connection, term: str) -> list[dict[str, Any]]:
+        cleaned_term = self._clean_search_term(term)
+        normalized_term = self._normalize_search_text(cleaned_term)
         query = """
         SELECT 'lead' AS entity_type, id, company_name, contact_name, full_name, email, phone, owner_name, last_activity_time
         FROM leads
-        WHERE lower(company_name) LIKE lower(?) OR lower(contact_name) LIKE lower(?) OR lower(full_name) LIKE lower(?)
         UNION ALL
         SELECT 'contact' AS entity_type, id, company_name, contact_name, full_name, email, phone, owner_name, last_activity_time
         FROM contacts
-        WHERE lower(company_name) LIKE lower(?) OR lower(contact_name) LIKE lower(?) OR lower(full_name) LIKE lower(?)
-        LIMIT 10
         """
-        wildcard = f"%{term}%"
-        rows = conn.execute(query, (wildcard, wildcard, wildcard, wildcard, wildcard, wildcard)).fetchall()
-        return [dict(row) for row in rows]
+        rows = [dict(row) for row in conn.execute(query).fetchall()]
+        scored: list[tuple[int, dict[str, Any]]] = []
+
+        for row in rows:
+            fields = [
+                row.get("company_name") or "",
+                row.get("contact_name") or "",
+                row.get("full_name") or "",
+            ]
+            joined = " ".join(fields)
+            normalized_joined = self._normalize_search_text(joined)
+            if not normalized_joined:
+                continue
+
+            score = 0
+            if normalized_term and normalized_term in normalized_joined:
+                score += 50
+
+            tokens = [token for token in normalized_term.split() if token]
+            token_hits = sum(1 for token in tokens if token in normalized_joined)
+            score += token_hits * 10
+
+            if row.get("company_name") and normalized_term == self._normalize_search_text(row["company_name"]):
+                score += 40
+            if row.get("contact_name") and normalized_term == self._normalize_search_text(row["contact_name"]):
+                score += 30
+
+            if score > 0:
+                scored.append((score, row))
+
+        scored.sort(key=lambda item: (-item[0], item[1].get("company_name") or item[1].get("full_name") or ""))
+        return [row for _, row in scored[:10]]
 
     def _recent_interactions_for_entity(self, conn: sqlite3.Connection, term: str) -> list[dict[str, Any]]:
-        wildcard = f"%{term}%"
+        matches = self._entity_matches(conn, term)
+        related_ids = [match["id"] for match in matches if match.get("id")]
+        if related_ids:
+            placeholders = ", ".join("?" for _ in related_ids)
+            query = f"""
+            SELECT source_type, related_name, owner_name, interaction_at, status, summary
+            FROM interactions
+            WHERE related_id IN ({placeholders})
+            ORDER BY interaction_at DESC
+            LIMIT 10
+            """
+            return [dict(row) for row in conn.execute(query, related_ids).fetchall()]
+
+        wildcard = f"%{self._clean_search_term(term)}%"
         query = """
         SELECT source_type, related_name, owner_name, interaction_at, status, summary
         FROM interactions
@@ -293,7 +336,20 @@ class SalesAssistantService:
         return [dict(row) for row in conn.execute(query, (wildcard,)).fetchall()]
 
     def _recent_notes_for_entity(self, conn: sqlite3.Connection, term: str) -> list[dict[str, Any]]:
-        wildcard = f"%{term}%"
+        matches = self._entity_matches(conn, term)
+        parent_ids = [match["id"] for match in matches if match.get("id")]
+        if parent_ids:
+            placeholders = ", ".join("?" for _ in parent_ids)
+            query = f"""
+            SELECT parent_name, parent_module, created_time, title, content_text
+            FROM notes
+            WHERE parent_id IN ({placeholders})
+            ORDER BY created_time DESC
+            LIMIT 8
+            """
+            return [dict(row) for row in conn.execute(query, parent_ids).fetchall()]
+
+        wildcard = f"%{self._clean_search_term(term)}%"
         query = """
         SELECT parent_name, parent_module, created_time, title, content_text
         FROM notes
@@ -304,44 +360,37 @@ class SalesAssistantService:
         return [dict(row) for row in conn.execute(query, (wildcard, wildcard)).fetchall()]
 
     def _emails_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
-        wildcard = f"%{term}%"
-        query = """
-        SELECT DISTINCT email
-        FROM (
-            SELECT email, company_name, contact_name, full_name FROM leads
-            UNION ALL
-            SELECT email, company_name, contact_name, full_name FROM contacts
-        )
-        WHERE email IS NOT NULL
-          AND (
-              lower(company_name) LIKE lower(?)
-              OR lower(contact_name) LIKE lower(?)
-              OR lower(full_name) LIKE lower(?)
-          )
-        ORDER BY email
-        """
-        rows = [row[0] for row in conn.execute(query, (wildcard, wildcard, wildcard)).fetchall()]
+        rows = self._field_values_for_entity(conn, term, "email")
         return "\n".join(rows) if rows else "No encontre correos para ese cliente o prospecto."
 
     def _phones_for_entity(self, conn: sqlite3.Connection, term: str) -> str:
-        wildcard = f"%{term}%"
-        query = """
-        SELECT DISTINCT phone
+        rows = self._field_values_for_entity(conn, term, "phone")
+        return "\n".join(rows) if rows else "No encontre telefonos para ese cliente o prospecto."
+
+    def _field_values_for_entity(self, conn: sqlite3.Connection, term: str, field_name: str) -> list[str]:
+        matches = self._entity_matches(conn, term)
+        values = [match.get(field_name) for match in matches if match.get(field_name)]
+        deduplicated = sorted({value.strip() for value in values if value and value.strip()})
+        if deduplicated:
+            return deduplicated
+
+        wildcard = f"%{self._clean_search_term(term)}%"
+        query = f"""
+        SELECT DISTINCT {field_name}
         FROM (
-            SELECT phone, company_name, contact_name, full_name FROM leads
+            SELECT {field_name}, company_name, contact_name, full_name FROM leads
             UNION ALL
-            SELECT phone, company_name, contact_name, full_name FROM contacts
+            SELECT {field_name}, company_name, contact_name, full_name FROM contacts
         )
-        WHERE phone IS NOT NULL
+        WHERE {field_name} IS NOT NULL
           AND (
               lower(company_name) LIKE lower(?)
               OR lower(contact_name) LIKE lower(?)
               OR lower(full_name) LIKE lower(?)
           )
-        ORDER BY phone
+        ORDER BY {field_name}
         """
-        rows = [row[0] for row in conn.execute(query, (wildcard, wildcard, wildcard)).fetchall()]
-        return "\n".join(rows) if rows else "No encontre telefonos para ese cliente o prospecto."
+        return [row[0] for row in conn.execute(query, (wildcard, wildcard, wildcard)).fetchall()]
 
     def _owner_load(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         query = """
@@ -449,7 +498,7 @@ class SalesAssistantService:
         for separator in separators:
             normalized = normalized.replace(separator, "|")
         terms = [part.strip(" ?.\"'") for part in normalized.split("|")]
-        cleaned_terms = [term for term in terms if len(term.strip()) >= 3]
+        cleaned_terms = [self._clean_search_term(term) for term in terms if len(term.strip()) >= 3]
         results: list[dict[str, Any]] = []
         for term in cleaned_terms[:2]:
             matches = self._entity_matches(conn, term)
@@ -468,17 +517,58 @@ class SalesAssistantService:
             })
         return results
 
+    def _normalize_search_text(self, value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+        return " ".join(ascii_text.lower().split())
+
+    def _clean_search_term(self, value: str) -> str:
+        cleaned = value or ""
+        removable_prefixes = [
+            "compara ",
+            "comparar ",
+            "comparativa ",
+            "dame ",
+            "cliente ",
+            "prospecto ",
+            "contacto ",
+            "empresa ",
+        ]
+        lowered = cleaned.lower()
+        changed = True
+        while changed:
+            changed = False
+            for prefix in removable_prefixes:
+                if lowered.startswith(prefix):
+                    cleaned = cleaned[len(prefix):].strip()
+                    lowered = cleaned.lower()
+                    changed = True
+        return cleaned.strip()
+
     def _last_interactions(self, conn: sqlite3.Connection, term: str | None) -> list[dict[str, Any]]:
         if term:
-            wildcard = f"%{term}%"
-            query = """
-            SELECT related_name, owner_name, source_type, interaction_at, status, summary
-            FROM interactions
-            WHERE lower(related_name) LIKE lower(?)
-            ORDER BY interaction_at DESC
-            LIMIT 10
-            """
-            rows = conn.execute(query, (wildcard,)).fetchall()
+            matches = self._entity_matches(conn, term)
+            related_ids = [match["id"] for match in matches if match.get("id")]
+            if related_ids:
+                placeholders = ", ".join("?" for _ in related_ids)
+                query = f"""
+                SELECT related_name, owner_name, source_type, interaction_at, status, summary
+                FROM interactions
+                WHERE related_id IN ({placeholders})
+                ORDER BY interaction_at DESC
+                LIMIT 10
+                """
+                rows = conn.execute(query, related_ids).fetchall()
+            else:
+                wildcard = f"%{self._clean_search_term(term)}%"
+                query = """
+                SELECT related_name, owner_name, source_type, interaction_at, status, summary
+                FROM interactions
+                WHERE lower(related_name) LIKE lower(?)
+                ORDER BY interaction_at DESC
+                LIMIT 10
+                """
+                rows = conn.execute(query, (wildcard,)).fetchall()
         else:
             query = """
             SELECT related_name, owner_name, source_type, interaction_at, status, summary
@@ -560,6 +650,56 @@ class SalesAssistantService:
             f"{row['related_name']} | {row['owner_name']} | prioridad {row['priority_label']} | score {row['score']} | {' / '.join(row['reasons'])}"
             for row in rows
         )
+
+    def _format_comparison_candidates(self, rows: list[dict[str, Any]]) -> str | None:
+        if len(rows) < 2:
+            return None
+
+        formatted_sections: list[str] = []
+        valid_candidates = 0
+        for candidate in rows[:2]:
+            top_match = candidate["matches"][0] if candidate.get("matches") else None
+            recent_note = candidate["recent_notes"][0] if candidate.get("recent_notes") else None
+            owners = ", ".join(candidate.get("owners") or []) or "Sin propietario identificado"
+
+            if top_match:
+                valid_candidates += 1
+                entity_name = (
+                    top_match.get("company_name")
+                    or top_match.get("contact_name")
+                    or top_match.get("full_name")
+                    or candidate["term"]
+                )
+                email = top_match.get("email") or "Sin correo"
+                phone = top_match.get("phone") or "Sin telefono"
+            else:
+                entity_name = candidate["term"]
+                email = "Sin correo"
+                phone = "Sin telefono"
+
+            note_summary = "Sin notas recientes relevantes."
+            if recent_note:
+                note_summary = recent_note.get("content_text") or recent_note.get("title") or "Nota sin contenido visible."
+                note_summary = " ".join(note_summary.split())[:180]
+
+            formatted_sections.append(
+                "\n".join(
+                    [
+                        entity_name,
+                        f"- Propietario(s): {owners}",
+                        f"- Ultimo toque: {candidate.get('latest_touch') or 'Sin interaccion registrada'}",
+                        f"- Interacciones recientes detectadas: {candidate.get('interaction_count', 0)}",
+                        f"- Correo: {email}",
+                        f"- Telefono: {phone}",
+                        f"- Nota reciente: {note_summary}",
+                    ]
+                )
+            )
+
+        if valid_candidates == 0:
+            return None
+
+        return "Comparativa encontrada:\n\n" + "\n\n".join(formatted_sections)
 
     def _format_last_interactions(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
