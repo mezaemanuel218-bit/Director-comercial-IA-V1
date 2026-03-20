@@ -78,3 +78,13 @@ def index_documents(folder: Path | None = None) -> int:
     conn.close()
     return total_documents
 
+
+def indexed_documents_count() -> int:
+    conn = sqlite3.connect(WAREHOUSE_DB)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM documents").fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        conn.close()

@@ -87,10 +87,10 @@ async function checkHealth() {
     const response = await fetch("/health");
     const data = await readJsonSafely(response);
     healthStatus.textContent = data.status === "ok" ? "Conectada" : "Revisar";
-    healthDetail.textContent = "API local lista para responder y refrescar informacion.";
+    healthDetail.textContent = "API lista para responder y refrescar informacion.";
   } catch (error) {
     healthStatus.textContent = "Sin conexion";
-    healthDetail.textContent = "No fue posible conectar con la API local.";
+    healthDetail.textContent = "No fue posible conectar con la API.";
   }
 }
 

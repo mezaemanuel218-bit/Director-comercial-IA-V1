@@ -55,7 +55,7 @@ class SalesAssistantService:
         evidence["active_user"] = self._user_context(user)
         evidence["owner_scope"] = owner_scope
 
-        if evidence.get("direct_answer") and intent.mode == "data":
+        if evidence.get("direct_answer") and self._should_prefer_direct_answer(intent, evidence):
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
@@ -81,6 +81,8 @@ class SalesAssistantService:
         )
         content = (response.choices[0].message.content or "").strip()
         answer = content or evidence.get("direct_answer") or self._format_evidence_fallback(evidence)
+        if self._response_looks_empty(answer) and evidence.get("direct_answer"):
+            answer = evidence["direct_answer"]
         return AssistantResponse(
             mode=intent.mode,
             sources=evidence["sources"],
@@ -209,6 +211,36 @@ class SalesAssistantService:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _should_prefer_direct_answer(self, intent: QuestionIntent, evidence: dict[str, Any]) -> bool:
+        if intent.mode == "data":
+            return True
+        structured_keys = [
+            "today_call_list",
+            "comparison_candidates",
+            "owner_load",
+            "owner_kpis",
+            "global_kpis",
+            "assigned_clients",
+            "pending_tasks",
+            "today_pending",
+            "stale_contacts",
+            "latest_contacted",
+            "last_interactions",
+            "risk_profile",
+        ]
+        return any(evidence.get(key) for key in structured_keys)
+
+    def _response_looks_empty(self, answer: str) -> bool:
+        normalized = self._normalize_search_text(answer)
+        empty_markers = [
+            "no hay registros",
+            "no se encontraron registros",
+            "no existe informacion",
+            "no hay evidencia",
+            "no es posible realizar",
+        ]
+        return any(marker in normalized for marker in empty_markers)
+
     def _collect_evidence(self, question: str, intent: QuestionIntent, owner_scope: str | None = None) -> dict[str, Any]:
         entity_term = self._extract_entity_hint(question)
         evidence: dict[str, Any] = {
@@ -264,19 +296,27 @@ class SalesAssistantService:
                 evidence["direct_answer"] = self._format_today_pending(evidence["today_pending"])
             elif intent.asks_for_pending_commitments:
                 evidence["pending_tasks"] = self._pending_tasks(conn, owner_scope)
-                evidence["direct_answer"] = self._format_pending_tasks(evidence["pending_tasks"]) if intent.mode == "data" else None
+                evidence["direct_answer"] = self._format_pending_tasks(evidence["pending_tasks"])
             elif intent.asks_for_stale_contacts:
                 evidence["stale_contacts"] = self._stale_contacts(conn, owner_scope)
-                evidence["direct_answer"] = self._format_stale_contacts(evidence["stale_contacts"]) if intent.mode == "data" else None
+                evidence["direct_answer"] = self._format_stale_contacts(evidence["stale_contacts"])
             elif intent.asks_for_today_call_list:
                 evidence["today_call_list"] = self.get_priority_followups(owner=owner_scope, limit=15)
-                evidence["direct_answer"] = self._format_today_call_list(evidence["today_call_list"]) if intent.mode == "data" else None
+                evidence["direct_answer"] = (
+                    self._format_today_call_list(evidence["today_call_list"])
+                    if intent.mode == "data"
+                    else self._format_today_call_analysis(evidence["today_call_list"], owner_scope)
+                )
             elif intent.asks_for_comparison:
                 evidence["comparison_candidates"] = self._comparison_candidates(conn, question, owner_scope)
-                evidence["direct_answer"] = self._format_comparison_candidates(evidence["comparison_candidates"])
+                evidence["direct_answer"] = (
+                    self._format_comparison_candidates(evidence["comparison_candidates"])
+                    if intent.mode == "data"
+                    else self._format_comparison_analysis(evidence["comparison_candidates"])
+                )
             elif intent.asks_for_last_contact:
                 evidence["last_interactions"] = self._last_interactions(conn, entity_term, owner_scope)
-                evidence["direct_answer"] = self._format_last_interactions(evidence["last_interactions"]) if intent.mode == "data" else None
+                evidence["direct_answer"] = self._format_last_interactions(evidence["last_interactions"])
             elif intent.asks_for_kpis:
                 window_days = 7 if intent.asks_for_weekly_window else None
                 if intent.asks_for_global_kpis or "de todos los vendedores" in self._normalize_search_text(question):
@@ -1191,12 +1231,71 @@ class SalesAssistantService:
             for row in rows
         )
 
+    def _format_today_call_analysis(self, rows: list[dict[str, Any]], owner_scope: str | None) -> str:
+        if not rows:
+            owner_label = owner_scope or "el equipo"
+            return (
+                "Hechos:\n"
+                f"- No se detectaron clientes priorizados para llamar hoy para {owner_label}.\n\n"
+                "Interpretacion:\n"
+                "- No hay evidencia suficiente de seguimiento vencido o compromisos abiertos para priorizar una llamada hoy.\n\n"
+                "Recomendacion:\n"
+                "- Revisa notas recientes, nuevas tareas o sincroniza Zoho para confirmar si entraron pendientes nuevos."
+            )
+        top = rows[:5]
+        facts = [f"- {row['related_name']} aparece con prioridad {row['priority_label']} y score {row['score']}." for row in top]
+        reasons = []
+        for row in top[:3]:
+            joined = " ".join(row.get("reasons") or [])
+            reasons.append(f"- {row['related_name']}: {joined}")
+        recommendations = [f"- Prioriza primero a {row['related_name']}." for row in top[:3]]
+        return "\n".join(
+            [
+                "Hechos:",
+                *facts,
+                "",
+                "Interpretacion:",
+                *reasons,
+                "",
+                "Recomendacion:",
+                *recommendations,
+            ]
+        )
+
     def _format_comparison_candidates(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "No encontre evidencia suficiente para comparar."
         return "\n".join(
             f"{row['entity']}: score {row['score']} | coincidencias {row['matches']} | interacciones {row['recent_interactions']} | notas {row['recent_notes']}"
             for row in rows
+        )
+
+    def _format_comparison_analysis(self, rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return (
+                "Hechos:\n"
+                "- No encontre evidencia suficiente para comparar las entidades solicitadas.\n\n"
+                "Interpretacion:\n"
+                "- La base no ofrece señales suficientes para priorizar una sobre otra.\n\n"
+                "Recomendacion:\n"
+                "- Registra actividad o agrega informacion comercial antes de compararlas."
+            )
+        facts = [
+            f"- {row['entity']}: {row['matches']} coincidencias, {row['recent_interactions']} interacciones y {row['recent_notes']} notas."
+            for row in rows
+        ]
+        best = max(rows, key=lambda item: item["score"])
+        return "\n".join(
+            [
+                "Hechos:",
+                *facts,
+                "",
+                "Interpretacion:",
+                f"- {best['entity']} tiene la evidencia comercial mas fuerte dentro del CRM actual.",
+                "",
+                "Recomendacion:",
+                f"- Prioriza {best['entity']} si necesitas decidir con la informacion disponible hoy.",
+            ]
         )
 
     def _format_last_interactions(self, rows: list[dict[str, Any]]) -> str:

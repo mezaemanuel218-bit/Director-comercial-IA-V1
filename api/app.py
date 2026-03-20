@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from assistant_core.auth import AppUser, authenticate_user, get_user, session_secret_key
 from assistant_core.config import PROJECT_ROOT
-from assistant_core.documents import index_documents
+from assistant_core.documents import index_documents, indexed_documents_count
 from assistant_core.history import ensure_history_schema, fetch_history, save_history
 from assistant_core.reporting import available_owners, dashboard_metrics
 from assistant_core.runtime_state import ensure_runtime_schema, get_runtime_value, set_runtime_value
@@ -51,11 +51,14 @@ ZOHO_REFRESH_COOLDOWN_MINUTES = 10
 
 
 def prepare_local_state() -> None:
-    build_warehouse()
-    index_documents()
     ensure_history_schema()
     ensure_runtime_schema()
     counts = warehouse_counts()
+    if not any(counts.get(table, 0) for table in ("leads", "contacts", "notes", "calls", "tasks", "events", "interactions")):
+        build_warehouse()
+        counts = warehouse_counts()
+    if indexed_documents_count() == 0:
+        index_documents()
     has_snapshot = counts.get("leads", 0) > 0 or counts.get("contacts", 0) > 0
     existing_refresh = get_runtime_value("last_refresh")
     existing_status = get_runtime_value("last_refresh_status")
@@ -128,6 +131,7 @@ class RefreshResponse(BaseModel):
 
 class HistoryItem(BaseModel):
     id: int
+    username: str | None = None
     question: str
     answer: str
     mode: str | None = None
@@ -224,6 +228,7 @@ def ask(payload: AskRequest, user: AppUser = Depends(require_user)) -> AskRespon
             mode=result.mode,
             sources=result.sources,
             used_web=result.used_web,
+            username=user.username,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -310,9 +315,9 @@ def refresh(user: AppUser = Depends(require_user)) -> RefreshResponse:
 
 
 @app.get("/history", response_model=list[HistoryItem])
-def history(limit: int = 20, user: UserResponse = Depends(require_user)) -> list[HistoryItem]:
+def history(limit: int = 20, user: AppUser = Depends(require_user)) -> list[HistoryItem]:
     try:
-        items = fetch_history(limit=limit)
+        items = fetch_history(limit=limit, username=user.username)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return [HistoryItem(**item) for item in items]
@@ -324,7 +329,7 @@ def dashboard(
     date_from: str | None = None,
     date_to: str | None = None,
     status: str | None = None,
-    user: UserResponse = Depends(require_user),
+    user: AppUser = Depends(require_user),
 ) -> DashboardResponse:
     try:
         data = dashboard_metrics(owner=owner, date_from=date_from, date_to=date_to, status=status)
@@ -349,7 +354,7 @@ def dashboard(
 
 
 @app.get("/owners", response_model=list[str])
-def owners(user: UserResponse = Depends(require_user)) -> list[str]:
+def owners(user: AppUser = Depends(require_user)) -> list[str]:
     try:
         return available_owners()
     except Exception as exc:

@@ -9,6 +9,7 @@ HISTORY_SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS conversation_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
         question TEXT NOT NULL,
         answer TEXT NOT NULL,
         mode TEXT,
@@ -29,20 +30,24 @@ def ensure_history_schema() -> None:
     cursor = conn.cursor()
     for statement in HISTORY_SCHEMA:
         cursor.execute(statement)
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(conversation_history)").fetchall()}
+    if "username" not in columns:
+        cursor.execute("ALTER TABLE conversation_history ADD COLUMN username TEXT")
     conn.commit()
     conn.close()
 
 
-def save_history(question: str, answer: str, mode: str, sources: list[str], used_web: bool) -> None:
+def save_history(question: str, answer: str, mode: str, sources: list[str], used_web: bool, username: str | None = None) -> None:
     ensure_history_schema()
     conn = sqlite3.connect(WAREHOUSE_DB)
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO conversation_history(question, answer, mode, sources, used_web, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO conversation_history(username, question, answer, mode, sources, used_web, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            username,
             question,
             answer,
             mode,
@@ -55,18 +60,30 @@ def save_history(question: str, answer: str, mode: str, sources: list[str], used
     conn.close()
 
 
-def fetch_history(limit: int = 20) -> list[dict[str, Any]]:
+def fetch_history(limit: int = 20, username: str | None = None) -> list[dict[str, Any]]:
     ensure_history_schema()
     conn = sqlite3.connect(WAREHOUSE_DB)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT id, question, answer, mode, sources, used_web, created_at
-        FROM conversation_history
-        ORDER BY created_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+    if username:
+        rows = conn.execute(
+            """
+            SELECT id, username, question, answer, mode, sources, used_web, created_at
+            FROM conversation_history
+            WHERE username = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (username, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, username, question, answer, mode, sources, used_web, created_at
+            FROM conversation_history
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
