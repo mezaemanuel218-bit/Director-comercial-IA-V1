@@ -23,7 +23,7 @@ APP_USERS = {
     "evaldez": AppUser(
         username="evaldez",
         display_name="Eduardo Valdez",
-        role="ceo",
+        role="seller",
         crm_owner_name="Eduardo Valdez",
         password_hash=DEFAULT_PASSWORD_HASH,
     ),

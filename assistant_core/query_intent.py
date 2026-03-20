@@ -1,8 +1,15 @@
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 
 
 ResponseMode = Literal["data", "analysis", "hybrid"]
+
+
+def _normalize(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+    return " ".join(ascii_text.lower().split())
 
 
 @dataclass
@@ -34,88 +41,50 @@ class QuestionIntent:
 
 
 def classify_question(question: str) -> QuestionIntent:
-    q = question.lower()
+    q = _normalize(question)
 
-    asks_for_emails = "correo" in q or "mail" in q or "email" in q
-    asks_for_names = "nombre" in q or "nombres" in q or "persona" in q or "personas" in q or "contacto" in q or "contactos" in q
-    asks_for_phones = "telefono" in q or "teléfono" in q or "numero" in q or "número" in q
-    asks_for_contact_directory = ("contacto" in q or "contactos" in q) and (" de " in q or " del " in q or ":" in q)
+    asks_for_emails = any(token in q for token in ["correo", "correos", "mail", "email", "emails"])
+    asks_for_names = any(token in q for token in ["nombre", "nombres", "persona", "personas", "contacto", "contactos"])
+    asks_for_phones = any(token in q for token in ["telefono", "telefonos", "numero", "numeros", "celular", "movil"])
+    asks_for_contact_directory = any(token in q for token in ["contacto", "contactos"]) and any(token in q for token in [" de ", " del ", ":"])
 
     asks_for_owner_load = (
-        ("cuantos clientes" in q or "cuántos clientes" in q or "asignados" in q or "carga" in q)
-        and ("vendedor" in q or "propietario" in q or "agente" in q or "clientes" in q)
-    ) or (
-        "quien tiene mas clientes asignados" in q
-        or "quién tiene más clientes asignados" in q
-        or "carga por vendedor" in q
-        or "quien tiene mas prospectos asignados" in q
-        or "quién tiene más prospectos asignados" in q
+        (any(token in q for token in ["cuantos clientes", "asignados", "carga"]) and any(token in q for token in ["vendedor", "propietario", "agente", "clientes"]))
+        or any(token in q for token in ["quien tiene mas clientes asignados", "carga por vendedor", "quien tiene mas prospectos asignados"])
     )
 
-    asks_for_assigned_clients = (
-        "mis clientes" in q
-        or "quienes son mis clientes" in q
-        or "quiénes son mis clientes" in q
-        or "clientes de " in q
-        or "clientes asignados de " in q
-        or "prospectos de " in q
-        or "prospectos asignados de " in q
+    asks_for_assigned_clients = any(
+        token in q
+        for token in [
+            "mis clientes",
+            "quienes son mis clientes",
+            "clientes de ",
+            "clientes asignados de ",
+            "prospectos de ",
+            "prospectos asignados de ",
+        ]
     )
 
-    asks_for_interactions_by_owner = "interacciones" in q and ("vendedor" in q or "agente" in q or "propietario" in q or "cada" in q)
-    asks_for_generic_relative_interactions = ("interacciones" in q or "actividad" in q) and ("ayer" in q or "antier" in q or "anteayer" in q)
-    asks_for_recent_activity_by_owner = ("actividad reciente" in q or "mas actividad reciente" in q or "más actividad reciente" in q) and ("quien" in q or "quién" in q or "vendedor" in q)
+    asks_for_interactions_by_owner = "interacciones" in q and any(token in q for token in ["vendedor", "agente", "propietario", "cada"])
+    asks_for_generic_relative_interactions = any(token in q for token in ["interacciones", "actividad"]) and any(token in q for token in ["ayer", "antier", "anteayer"])
+    asks_for_recent_activity_by_owner = any(token in q for token in ["actividad reciente", "mas actividad reciente"]) and any(token in q for token in ["quien", "vendedor"])
     asks_for_risks = "riesgo" in q or "riesgos" in q
-    asks_for_kpis = "kpi" in q or "kpis" in q or ("metric" in q and ("nota" in q or "cliente" in q))
-    asks_for_global_kpis = asks_for_kpis and ("global" in q or "todos" in q or "vendedores" in q or "equipo" in q)
+    asks_for_kpis = "kpi" in q or "kpis" in q or ("metric" in q and any(token in q for token in ["nota", "cliente"]))
+    asks_for_global_kpis = asks_for_kpis and any(token in q for token in ["global", "todos", "vendedores", "equipo"])
     asks_for_weekly_window = "semana" in q
-    asks_for_last_contact = "ultimo contacto" in q or "último contacto" in q or "ayer" in q or "antier" in q or "anteayer" in q
-    asks_for_pending_commitments = "compromiso" in q or "pendiente" in q or "tarea" in q
-    asks_for_stale_contacts = "30 dias" in q or "30 días" in q or "sin contacto" in q
-    asks_for_today_call_list = "a quien debo llamar hoy" in q or "a quién debo llamar hoy" in q or "hoy y por que" in q
-    asks_for_comparison = "compara" in q or "comparativa" in q or "vs" in q or "diferencia entre" in q
-    wants_web = "web" in q or "internet" in q
-    asks_for_yesterday_contacts = (
-        ("ayer" in q)
-        and ("hable" in q or "hablé" in q or "llame" in q or "llamé" in q or "contacte" in q or "contacté" in q)
-    )
-    asks_for_day_before_yesterday_contacts = (
-        ("antier" in q or "anteayer" in q)
-        and ("hable" in q or "hablé" in q or "llame" in q or "llamé" in q or "contacte" in q or "contacté" in q)
-    )
-    asks_for_latest_contacted = (
-        "ultimo cliente" in q
-        or "último cliente" in q
-        or "cliente que se contacto a lo ultimo" in q
-        or "cliente que se contactó a lo último" in q
-    )
-    asks_for_today_pending = ("hoy" in q) and ("pendiente" in q or "compromiso" in q or "tarea" in q)
+    asks_for_last_contact = any(token in q for token in ["ultimo contacto", "ayer", "antier", "anteayer"])
+    asks_for_pending_commitments = any(token in q for token in ["compromiso", "pendiente", "tarea"])
+    asks_for_stale_contacts = any(token in q for token in ["30 dias", "sin contacto"])
+    asks_for_today_call_list = "a quien debo llamar hoy" in q or "hoy y por que" in q
+    asks_for_comparison = any(token in q for token in ["compara", "comparativa", " vs ", "diferencia entre"])
+    wants_web = any(token in q for token in ["web", "internet"])
+    asks_for_yesterday_contacts = "ayer" in q and any(token in q for token in ["hable", "llame", "contacte"])
+    asks_for_day_before_yesterday_contacts = any(token in q for token in ["antier", "anteayer"]) and any(token in q for token in ["hable", "llame", "contacte"])
+    asks_for_latest_contacted = any(token in q for token in ["ultimo cliente", "cliente que se contacto a lo ultimo"])
+    asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "compromiso", "tarea"])
 
-    analysis_signals = [
-        "plan",
-        "estrategia",
-        "por que",
-        "por qué",
-        "recomienda",
-        "conviene",
-        "analiza",
-        "compar",
-        "riesgo",
-        "riesgos",
-    ]
-    data_signals = [
-        "solo",
-        "dame",
-        "lista",
-        "correos",
-        "telefonos",
-        "teléfonos",
-        "nombres",
-        "ultimo",
-        "último",
-        "kpi",
-        "kpis",
-    ]
+    analysis_signals = ["plan", "estrategia", "por que", "recomienda", "conviene", "analiza", "compar", "riesgo"]
+    data_signals = ["solo", "dame", "lista", "correos", "telefonos", "nombres", "ultimo", "kpi", "kpis"]
 
     has_analysis = any(signal in q for signal in analysis_signals)
     has_data = any(signal in q for signal in data_signals)
