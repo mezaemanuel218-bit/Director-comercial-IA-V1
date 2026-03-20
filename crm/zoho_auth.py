@@ -7,11 +7,12 @@ load_dotenv()
 CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
 CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
+ACCOUNTS_URL = os.getenv("ZOHO_ACCOUNTS_URL", "https://accounts.zoho.com")
 
 
 def get_access_token():
 
-    url = "https://accounts.zoho.com/oauth/v2/token"
+    url = f"{ACCOUNTS_URL.rstrip('/')}/oauth/v2/token"
 
     params = {
         "refresh_token": REFRESH_TOKEN,
@@ -21,7 +22,10 @@ def get_access_token():
     }
 
     r = requests.post(url, params=params, timeout=30)
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(
+            f"Zoho auth failed ({r.status_code}) en {url}: {r.text}"
+        )
 
     data = r.json()
 
