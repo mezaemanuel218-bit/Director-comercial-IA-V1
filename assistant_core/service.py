@@ -214,6 +214,10 @@ class SalesAssistantService:
                     evidence["direct_answer"] = self._contact_points_for_entity(conn, entity_term)
                 else:
                     evidence["direct_answer"] = self._emails_for_entity(conn, entity_term)
+            elif intent.asks_for_assigned_clients:
+                effective_owner = owner_scope or self._owner_scope_from_question(question)
+                evidence["assigned_clients"] = self._assigned_clients(conn, effective_owner)
+                evidence["direct_answer"] = self._format_assigned_clients(evidence["assigned_clients"], effective_owner)
             elif intent.asks_for_phones and entity_term:
                 evidence["direct_answer"] = self._phones_for_entity(conn, entity_term)
             elif intent.asks_for_owner_load:
@@ -258,8 +262,13 @@ class SalesAssistantService:
                 if intent.mode == "data":
                     evidence["direct_answer"] = self._format_today_call_list(evidence["today_call_list"])
             elif intent.asks_for_comparison:
-                evidence["comparison_candidates"] = self._comparison_candidates(conn, question)
-                evidence["direct_answer"] = self._format_comparison_candidates(evidence["comparison_candidates"])
+                owner_comparison = self._owner_comparison(conn, question)
+                if owner_comparison:
+                    evidence["owner_comparison"] = owner_comparison
+                    evidence["direct_answer"] = self._format_owner_comparison(owner_comparison)
+                else:
+                    evidence["comparison_candidates"] = self._comparison_candidates(conn, question)
+                    evidence["direct_answer"] = self._format_comparison_candidates(evidence["comparison_candidates"])
             elif intent.asks_for_last_contact:
                 evidence["last_interactions"] = self._last_interactions(conn, entity_term)
                 if intent.mode == "data":
@@ -396,6 +405,34 @@ class SalesAssistantService:
         if any(token in f" {normalized} " for token in [" mi ", " mis ", " yo ", "mias", "mios"]):
             return f"{question.strip()} del vendedor {owner_scope}"
         return question
+
+    def _owner_alias_map(self) -> dict[str, str]:
+        return {
+            "eduardo": "Eduardo Valdez",
+            "evaldez": "Eduardo Valdez",
+            "ceo": "Eduardo Valdez",
+            "pablo": "Pablo Melin Dorador",
+            "pmelin": "Pablo Melin Dorador",
+            "emmanuel": "Jesus Emmanuel Meza Guzmán",
+            "emeza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza": "Jesus Emmanuel Meza Guzmán",
+            "jesus emmanuel meza guzman": "Jesus Emmanuel Meza Guzmán",
+        }
+
+    def _owner_scope_from_question(self, question: str) -> str | None:
+        normalized = self._normalize_search_text(question)
+        for alias, owner_name in self._owner_alias_map().items():
+            if alias in normalized:
+                return owner_name
+        return None
+
+    def _mentioned_owner_names(self, question: str) -> list[str]:
+        normalized = self._normalize_search_text(question)
+        found: list[str] = []
+        for alias, owner_name in self._owner_alias_map().items():
+            if alias in normalized and owner_name not in found:
+                found.append(owner_name)
+        return found
 
     def _entity_matches(self, conn: sqlite3.Connection, term: str) -> list[dict[str, Any]]:
         cleaned_term = self._clean_search_term(term)
@@ -659,6 +696,43 @@ class SalesAssistantService:
             "interactions": interactions,
             "last_activity": last_activity_row[0] if last_activity_row else None,
         }
+
+    def _assigned_clients(self, conn: sqlite3.Connection, owner_scope: str | None = None) -> list[dict[str, Any]]:
+        if not owner_scope:
+            return []
+        query = """
+        SELECT entity_type, company_name, contact_name, full_name, email, phone, owner_name, last_activity_time
+        FROM (
+            SELECT 'lead' AS entity_type, company_name, contact_name, full_name, email, phone, owner_name, last_activity_time
+            FROM leads
+            UNION ALL
+            SELECT 'contact' AS entity_type, company_name, contact_name, full_name, email, phone, owner_name, last_activity_time
+            FROM contacts
+        )
+        WHERE owner_name = ?
+        ORDER BY COALESCE(last_activity_time, '') DESC, company_name ASC, full_name ASC
+        LIMIT 50
+        """
+        return [dict(row) for row in conn.execute(query, (owner_scope,)).fetchall()]
+
+    def _owner_comparison(self, conn: sqlite3.Connection, question: str) -> list[dict[str, Any]] | None:
+        owners = self._mentioned_owner_names(question)
+        if len(owners) < 2:
+            return None
+        results: list[dict[str, Any]] = []
+        for owner_name in owners[:2]:
+            kpis = self._owner_kpis(conn, owner_name)
+            recent = self._recent_activity_by_owner(conn, owner_name)
+            pending = self._pending_tasks(conn, owner_name)
+            results.append(
+                {
+                    "owner_name": owner_name,
+                    "kpis": kpis,
+                    "recent_activity": recent[0] if recent else None,
+                    "pending_count": len(pending),
+                }
+            )
+        return results
 
     def _risk_profile(self, conn: sqlite3.Connection, term: str) -> dict[str, Any]:
         matches = self._entity_matches(conn, term)
@@ -1016,6 +1090,62 @@ class SalesAssistantService:
             f"- Ultima actividad registrada: {kpis['last_activity'] or 'sin dato'}"
         )
 
+    def _format_assigned_clients(self, rows: list[dict[str, Any]], owner_scope: str | None = None) -> str:
+        if not owner_scope:
+            return "Necesito identificar al vendedor para mostrar su cartera."
+        if not rows:
+            return f"No encontre clientes o prospectos asignados a {owner_scope}."
+        lines = [f"Clientes y prospectos asignados a {owner_scope}:", ""]
+        lines.extend(
+            f"- {row['company_name'] or row['full_name'] or 'Sin nombre'} | {row['entity_type']} | "
+            f"Contacto: {row['contact_name'] or row['full_name'] or 'Sin contacto'} | "
+            f"Correo: {row['email'] or 'Sin correo'} | Telefono: {row['phone'] or 'Sin telefono'} | "
+            f"Ultima actividad: {row['last_activity_time'] or 'sin dato'}"
+            for row in rows
+        )
+        return "\n".join(lines)
+
+    def _format_owner_comparison(self, rows: list[dict[str, Any]]) -> str:
+        if len(rows) < 2:
+            return "No hay evidencia suficiente para comparar a esos vendedores."
+        first, second = rows[0], rows[1]
+
+        def score(item: dict[str, Any]) -> int:
+            recent = item.get("recent_activity") or {}
+            return (
+                item["kpis"]["leads"]
+                + item["kpis"]["contacts"]
+                + item["kpis"]["notes"]
+                + item["kpis"]["interactions"]
+                + (recent.get("recent_interactions") or 0)
+            )
+
+        first_score = score(first)
+        second_score = score(second)
+        leader = first if first_score >= second_score else second
+        trailer = second if leader is first else first
+
+        def block(item: dict[str, Any]) -> str:
+            recent = item.get("recent_activity") or {}
+            return (
+                f"{item['owner_name']}:\n"
+                f"- Leads: {item['kpis']['leads']}\n"
+                f"- Contacts: {item['kpis']['contacts']}\n"
+                f"- Notas: {item['kpis']['notes']}\n"
+                f"- Interacciones: {item['kpis']['interactions']}\n"
+                f"- Actividad reciente (30 dias): {recent.get('recent_interactions', 0)}\n"
+                f"- Pendientes abiertos: {item['pending_count']}\n"
+                f"- Ultima actividad: {item['kpis']['last_activity'] or 'sin dato'}"
+            )
+
+        return (
+            "Comparativa de vendedores:\n\n"
+            f"{block(first)}\n\n"
+            f"{block(second)}\n\n"
+            f"Conclusion:\n{leader['owner_name']} muestra mayor traccion comercial que {trailer['owner_name']} "
+            f"porque acumula mas cartera, notas e interacciones registradas."
+        )
+
     def _format_risk_profile(self, risk_profile: dict[str, Any], term: str) -> str:
         if not risk_profile.get("matches") and not risk_profile.get("notes") and not risk_profile.get("interactions"):
             return f"No hay evidencia disponible sobre el prospecto {term}. Por lo tanto, no puedo identificar riesgos específicos."
@@ -1187,6 +1317,7 @@ Reglas obligatorias:
 - Si la pregunta trata de seguimiento o prioridad comercial, explica la razon concreta de la prioridad.
 - Si comparas prospectos, contrasta actividad reciente, notas, responsable y señales de avance.
 - Si hay usuario activo, interpreta las preguntas en primera persona segun su perfil salvo que se mencione otro vendedor explicitamente.
+- Si hay fragmentos de PDFs internos relevantes, usalos y menciona el nombre del archivo en la respuesta.
 
 Modo detectado: {intent.mode}
 Pregunta: {question}

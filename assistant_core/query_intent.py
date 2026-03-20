@@ -13,6 +13,7 @@ class QuestionIntent:
     asks_for_names: bool
     asks_for_phones: bool
     asks_for_owner_load: bool
+    asks_for_assigned_clients: bool
     asks_for_interactions_by_owner: bool
     asks_for_recent_activity_by_owner: bool
     asks_for_risks: bool
@@ -44,6 +45,15 @@ def classify_question(question: str) -> QuestionIntent:
         or "quien tiene mas prospectos asignados" in q
         or "quién tiene más prospectos asignados" in q
     )
+    asks_for_assigned_clients = (
+        "mis clientes" in q
+        or "quienes son mis clientes" in q
+        or "quiénes son mis clientes" in q
+        or "clientes de " in q
+        or "clientes asignados de " in q
+        or "prospectos de " in q
+        or "prospectos asignados de " in q
+    )
     asks_for_interactions_by_owner = "interacciones" in q and ("vendedor" in q or "agente" in q or "propietario" in q or "cada" in q)
     asks_for_recent_activity_by_owner = ("actividad reciente" in q or "mas actividad reciente" in q or "más actividad reciente" in q) and ("quien" in q or "quién" in q or "vendedor" in q)
     asks_for_risks = "riesgo" in q or "riesgos" in q
@@ -52,7 +62,7 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_pending_commitments = "compromiso" in q or "pendiente" in q or "tarea" in q
     asks_for_stale_contacts = "30 dias" in q or "30 días" in q or "sin contacto" in q
     asks_for_today_call_list = "a quien debo llamar hoy" in q or "a quién debo llamar hoy" in q or "hoy y por que" in q
-    asks_for_comparison = "compara" in q or "comparativa" in q or "vs" in q
+    asks_for_comparison = "compara" in q or "comparativa" in q or "vs" in q or "diferencia entre" in q
     wants_web = "web" in q or "internet" in q
     asks_for_yesterday_contacts = (
         ("ayer" in q)
@@ -106,6 +116,7 @@ def classify_question(question: str) -> QuestionIntent:
         asks_for_names=asks_for_names,
         asks_for_phones=asks_for_phones,
         asks_for_owner_load=asks_for_owner_load,
+        asks_for_assigned_clients=asks_for_assigned_clients,
         asks_for_interactions_by_owner=asks_for_interactions_by_owner,
         asks_for_recent_activity_by_owner=asks_for_recent_activity_by_owner,
         asks_for_risks=asks_for_risks,
