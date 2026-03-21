@@ -217,6 +217,7 @@ class SalesAssistantService:
         structured_keys = [
             "today_call_list",
             "comparison_candidates",
+            "owner_comparison",
             "owner_load",
             "owner_kpis",
             "global_kpis",
@@ -308,12 +309,21 @@ class SalesAssistantService:
                     else self._format_today_call_analysis(evidence["today_call_list"], owner_scope)
                 )
             elif intent.asks_for_comparison:
-                evidence["comparison_candidates"] = self._comparison_candidates(conn, question, owner_scope)
-                evidence["direct_answer"] = (
-                    self._format_comparison_candidates(evidence["comparison_candidates"])
-                    if intent.mode == "data"
-                    else self._format_comparison_analysis(evidence["comparison_candidates"])
-                )
+                owner_names = self._mentioned_owner_names(question)
+                if len(owner_names) >= 2:
+                    evidence["owner_comparison"] = self._owner_comparison(conn, owner_names[:2])
+                    evidence["direct_answer"] = (
+                        self._format_owner_comparison(evidence["owner_comparison"])
+                        if intent.mode == "data"
+                        else self._format_owner_comparison_analysis(evidence["owner_comparison"])
+                    )
+                else:
+                    evidence["comparison_candidates"] = self._comparison_candidates(conn, question, owner_scope)
+                    evidence["direct_answer"] = (
+                        self._format_comparison_candidates(evidence["comparison_candidates"])
+                        if intent.mode == "data"
+                        else self._format_comparison_analysis(evidence["comparison_candidates"])
+                    )
             elif intent.asks_for_last_contact:
                 evidence["last_interactions"] = self._last_interactions(conn, entity_term, owner_scope)
                 evidence["direct_answer"] = self._format_last_interactions(evidence["last_interactions"])
@@ -843,6 +853,29 @@ class SalesAssistantService:
             )
         return results
 
+    def _owner_comparison(self, conn: sqlite3.Connection, owner_names: list[str]) -> list[dict[str, Any]]:
+        results = []
+        for owner_name in owner_names:
+            kpis = self._owner_kpis(conn, owner_name)
+            assigned_clients = self._assigned_clients(conn, owner_name)
+            pending_tasks = self._pending_tasks(conn, owner_name)
+            note_count = next((row["total"] for row in kpis.get("by_type", []) if row["source_type"] == "note"), 0)
+            call_count = next((row["total"] for row in kpis.get("by_type", []) if row["source_type"] == "call"), 0)
+            task_count = next((row["total"] for row in kpis.get("by_type", []) if row["source_type"] == "task"), 0)
+            results.append(
+                {
+                    "owner_name": owner_name,
+                    "total_interactions": kpis.get("total_interactions", 0),
+                    "unique_accounts": kpis.get("unique_accounts", 0),
+                    "assigned_clients": len(assigned_clients),
+                    "pending_tasks": len(pending_tasks),
+                    "note_count": note_count,
+                    "call_count": call_count,
+                    "task_count": task_count,
+                }
+            )
+        return results
+
     def _document_search(self, conn: sqlite3.Connection, question: str, entity_term: str | None = None) -> list[dict[str, Any]]:
         terms = []
         normalized_question = self._normalize_search_text(question)
@@ -1270,6 +1303,14 @@ class SalesAssistantService:
             for row in rows
         )
 
+    def _format_owner_comparison(self, rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return "No encontre evidencia suficiente para comparar vendedores."
+        return "\n".join(
+            f"{row['owner_name']} | Interacciones: {row['total_interactions']} | Cuentas unicas: {row['unique_accounts']} | Clientes asignados: {row['assigned_clients']} | Tareas pendientes: {row['pending_tasks']} | Notas: {row['note_count']} | Llamadas: {row['call_count']} | Tasks: {row['task_count']}"
+            for row in rows
+        )
+
     def _format_comparison_analysis(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return (
@@ -1295,6 +1336,34 @@ class SalesAssistantService:
                 "",
                 "Recomendacion:",
                 f"- Prioriza {best['entity']} si necesitas decidir con la informacion disponible hoy.",
+            ]
+        )
+
+    def _format_owner_comparison_analysis(self, rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return (
+                "Hechos:\n"
+                "- No encontre evidencia suficiente para comparar vendedores.\n\n"
+                "Interpretacion:\n"
+                "- La base no ofrece metricas suficientes para contrastar su actividad.\n\n"
+                "Recomendacion:\n"
+                "- Verifica sincronizacion de Zoho y vuelve a intentar."
+            )
+        facts = [
+            f"- {row['owner_name']}: {row['total_interactions']} interacciones, {row['unique_accounts']} cuentas unicas, {row['assigned_clients']} clientes asignados y {row['pending_tasks']} tareas pendientes."
+            for row in rows
+        ]
+        best = max(rows, key=lambda item: (item["total_interactions"], item["unique_accounts"], item["assigned_clients"]))
+        return "\n".join(
+            [
+                "Hechos:",
+                *facts,
+                "",
+                "Interpretacion:",
+                f"- {best['owner_name']} muestra la actividad comercial mas fuerte con la evidencia actual del CRM.",
+                "",
+                "Recomendacion:",
+                f"- Usa a {best['owner_name']} como referencia de actividad y revisa donde el otro vendedor tiene menos movimiento o menos cartera activa.",
             ]
         )
 

@@ -76,14 +76,14 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_pending_commitments = any(token in q for token in ["compromiso", "pendiente", "tarea"])
     asks_for_stale_contacts = any(token in q for token in ["30 dias", "sin contacto"])
     asks_for_today_call_list = "a quien debo llamar hoy" in q or "hoy y por que" in q
-    asks_for_comparison = any(token in q for token in ["compara", "comparativa", " vs ", "diferencia entre"])
+    asks_for_comparison = any(token in q for token in ["compara", "comparativa", " vs ", "diferencia entre", "diferencias entre"])
     wants_web = any(token in q for token in ["web", "internet"])
     asks_for_yesterday_contacts = "ayer" in q and any(token in q for token in ["hable", "llame", "contacte"])
     asks_for_day_before_yesterday_contacts = any(token in q for token in ["antier", "anteayer"]) and any(token in q for token in ["hable", "llame", "contacte"])
     asks_for_latest_contacted = any(token in q for token in ["ultimo cliente", "cliente que se contacto a lo ultimo"])
     asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "compromiso", "tarea"])
 
-    analysis_signals = ["plan", "estrategia", "por que", "recomienda", "conviene", "analiza", "compar", "riesgo"]
+    analysis_signals = ["plan", "estrategia", "por que", "recomienda", "conviene", "analiza", "compar", "riesgo", "diferencias entre"]
     data_signals = ["solo", "dame", "lista", "correos", "telefonos", "nombres", "ultimo", "kpi", "kpis"]
 
     has_analysis = any(signal in q for signal in analysis_signals)
