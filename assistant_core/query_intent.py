@@ -41,6 +41,7 @@ class QuestionIntent:
     asks_for_day_before_yesterday_contacts: bool
     asks_for_latest_contacted: bool
     asks_for_today_pending: bool
+    asks_for_latest_note: bool
 
 
 def classify_question(question: str) -> QuestionIntent:
@@ -134,6 +135,7 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_day_before_yesterday_contacts = any(token in q for token in ["antier", "anteayer"]) and any(token in q for token in ["hable", "llame", "contacte"])
     asks_for_latest_contacted = any(token in q for token in ["ultimo cliente", "cliente que se contacto a lo ultimo"])
     asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "compromiso", "tarea"])
+    asks_for_latest_note = any(token in q for token in ["ultima nota", "última nota", "nota agregada", "nota mas reciente", "nota más reciente"])
 
     analysis_signals = ["plan", "estrategia", "por que", "recomienda", "conviene", "analiza", "compar", "riesgo", "diferencias entre"]
     data_signals = ["solo", "dame", "lista", "correos", "telefonos", "nombres", "ultimo", "kpi", "kpis"]
@@ -176,4 +178,5 @@ def classify_question(question: str) -> QuestionIntent:
         asks_for_day_before_yesterday_contacts=asks_for_day_before_yesterday_contacts,
         asks_for_latest_contacted=asks_for_latest_contacted,
         asks_for_today_pending=asks_for_today_pending,
+        asks_for_latest_note=asks_for_latest_note,
     )

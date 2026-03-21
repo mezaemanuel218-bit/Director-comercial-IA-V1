@@ -259,6 +259,12 @@ class SalesAssistantService:
                 evidence["recent_interactions"] = self._recent_interactions_for_entity(conn, entity_term, owner_scope=owner_scope)
                 evidence["recent_notes"] = self._recent_notes_for_entity(conn, entity_term, owner_scope=owner_scope)
                 evidence["contact_rows"] = [row.__dict__ for row in self._contact_rows_for_entity(conn, entity_term, owner_scope=owner_scope)]
+            entity_has_evidence = bool(
+                evidence.get("matches")
+                or evidence.get("recent_interactions")
+                or evidence.get("recent_notes")
+                or evidence.get("contact_rows")
+            )
 
             if intent.asks_for_team_brief:
                 evidence["team_brief"] = self._team_brief(conn)
@@ -305,6 +311,9 @@ class SalesAssistantService:
             elif intent.asks_for_latest_contacted:
                 evidence["latest_contacted"] = self._latest_contacted(conn, owner_scope)
                 evidence["direct_answer"] = self._format_latest_contacted(evidence["latest_contacted"])
+            elif intent.asks_for_latest_note:
+                evidence["latest_note"] = self._latest_note(conn, owner_scope)
+                evidence["direct_answer"] = self._format_latest_note(evidence["latest_note"], owner_scope)
             elif intent.asks_for_today_pending:
                 evidence["today_pending"] = self._today_pending(conn, owner_scope)
                 evidence["direct_answer"] = self._format_today_pending(evidence["today_pending"])
@@ -345,12 +354,18 @@ class SalesAssistantService:
                 if intent.asks_for_global_kpis or "de todos los vendedores" in self._normalize_search_text(question):
                     evidence["global_kpis"] = self._global_kpis(conn, window_days)
                     evidence["direct_answer"] = self._format_global_kpis(evidence["global_kpis"], window_days)
+                elif entity_term and entity_has_evidence and not owner_scope:
+                    evidence["entity_kpis"] = self._entity_kpis(conn, entity_term)
+                    evidence["direct_answer"] = self._format_entity_kpis(evidence["entity_kpis"], window_days)
                 else:
                     evidence["owner_kpis"] = self._owner_kpis(conn, owner_scope, window_days)
                     evidence["direct_answer"] = self._format_owner_kpis(evidence["owner_kpis"], owner_scope, window_days)
             elif intent.asks_for_risks and entity_term:
                 evidence["risk_profile"] = self._risk_profile(conn, entity_term, owner_scope)
                 evidence["direct_answer"] = self._format_risk_profile(evidence["risk_profile"], entity_term)
+            elif entity_term and entity_has_evidence:
+                evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
+                evidence["direct_answer"] = self._format_entity_brief(evidence["entity_brief"])
 
             evidence["document_chunks"] = self._document_search(conn, question, entity_term)
             if evidence["document_chunks"]:
@@ -360,6 +375,21 @@ class SalesAssistantService:
 
     def _extract_entity_hint(self, question: str) -> str | None:
         normalized = self._normalize_search_text(question)
+        if " de " in normalized and any(token in normalized for token in ["correo", "telefono", "numero", "nombre", "contacto"]):
+            trailing = self._clean_search_term(normalized.rsplit(" de ", 1)[-1].strip(" ?.:"))
+            if trailing and trailing not in {"la semana", "semana"}:
+                return trailing
+        specific_patterns = [
+            r"kpi(?:s)?\s+(.+?)\s+de\s+la\s+semana$",
+            r"(?:dame|quiero|necesito)\s+(?:los\s+)?nombres(?:\s*,\s*|\s+y\s+)?(?:correos?|emails?)(?:\s*,\s*|\s+y\s+)?(?:numeros?|telefonos?)\s+de\s+(.+)$",
+            r"(?:dame|quiero|necesito)\s+(?:los\s+)?(?:nombres?|correos?|emails?|numeros?|telefonos?)\s+de\s+(.+)$",
+        ]
+        for pattern in specific_patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if match:
+                candidate = self._clean_search_term(match.group(1).strip(" ?.:"))
+                if candidate:
+                    return candidate
         patterns = [
             r"(?:correos?|emails?|telefonos?|numeros?|nombres?|contactos?)\s+(?:de|del)\s+(.+)$",
             r"(?:cliente|prospecto|contacto|empresa)\s*:\s*(.+)$",
@@ -376,6 +406,22 @@ class SalesAssistantService:
             trailing = self._clean_search_term(normalized.rsplit(":", 1)[-1].strip(" ?.:"))
             if trailing:
                 return trailing
+        if " de " in normalized and any(token in normalized for token in ["correo", "telefono", "numero", "nombre", "contacto", "kpi"]):
+            trailing = self._clean_search_term(normalized.rsplit(" de ", 1)[-1].strip(" ?.:"))
+            if trailing and trailing not in {"la semana", "semana"}:
+                return trailing
+        generic_questions = {
+            "kpi global",
+            "kpis globales",
+            "kpi mio de la semana",
+            "mis kpis",
+            "kpi semanal",
+            "ultima nota agregada",
+            "dame clientes calientes y clientes frios",
+            "dime todo lo que debo saber de mis contactos o leads",
+        }
+        if normalized and normalized not in generic_questions and len(normalized.split()) <= 5:
+            return self._clean_search_term(normalized)
         return None
 
     def _entity_matches(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> list[dict[str, Any]]:
@@ -627,6 +673,28 @@ class SalesAssistantService:
             "risk_profile": risks,
         }
 
+    def _entity_kpis(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> dict[str, Any]:
+        profiles = self._entity_profile_rows(conn, term, owner_scope=owner_scope)
+        interactions = self._recent_interactions_for_entity(conn, term, owner_scope=owner_scope)
+        notes = self._recent_notes_for_entity(conn, term, owner_scope=owner_scope)
+        pending = self._entity_pending_tasks(conn, term, owner_scope=owner_scope)
+        owners = sorted({row.get("owner_name") for row in profiles if row.get("owner_name")})
+        latest_touch = interactions[0]["interaction_at"] if interactions else None
+        latest_name = None
+        if profiles:
+            latest_name = profiles[0].get("company_name") or profiles[0].get("contact_name") or profiles[0].get("full_name")
+        return {
+            "entity_term": term,
+            "entity_name": latest_name or term,
+            "owners": owners,
+            "profile_matches": len(profiles),
+            "interactions": len(interactions),
+            "notes": len(notes),
+            "pending_tasks": len(pending),
+            "latest_touch": latest_touch,
+            "unit_rows": [row for row in profiles if row.get("unit_count")],
+        }
+
     def _owner_brief(self, conn: sqlite3.Connection, owner_scope: str | None) -> dict[str, Any]:
         if not owner_scope:
             return {}
@@ -860,6 +928,20 @@ class SalesAssistantService:
             query += " AND owner_name = ?"
             params.append(owner_scope)
         query += " ORDER BY interaction_at DESC LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+        return dict(row) if row else None
+
+    def _latest_note(self, conn: sqlite3.Connection, owner_scope: str | None = None) -> dict[str, Any] | None:
+        query = """
+        SELECT parent_name, owner_name, created_time, title, content_text
+        FROM notes
+        WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if owner_scope:
+            query += " AND owner_name = ?"
+            params.append(owner_scope)
+        query += " ORDER BY created_time DESC LIMIT 1"
         row = conn.execute(query, params).fetchone()
         return dict(row) if row else None
 
@@ -1558,6 +1640,31 @@ class SalesAssistantService:
                 )
         return "\n".join(lines)
 
+    def _format_entity_kpis(self, kpis: dict[str, Any], window_days: int | None) -> str:
+        if not kpis:
+            return "No encontre indicadores del cliente o prospecto solicitado."
+        entity_name = kpis.get("entity_name") or kpis.get("entity_term") or "la cuenta solicitada"
+        header = f"Indicadores comerciales de {entity_name}"
+        if window_days:
+            header += f" en los ultimos {window_days} dias"
+        lines = [
+            header,
+            f"Coincidencias CRM: {kpis.get('profile_matches', 0)}",
+            f"Interacciones recientes detectadas: {kpis.get('interactions', 0)}",
+            f"Notas CRM detectadas: {kpis.get('notes', 0)}",
+            f"Compromisos abiertos: {kpis.get('pending_tasks', 0)}",
+        ]
+        if kpis.get("owners"):
+            lines.append(f"Responsables CRM: {', '.join(kpis['owners'])}")
+        if kpis.get("latest_touch"):
+            lines.append(f"Ultimo movimiento detectado: {kpis['latest_touch']}")
+        unit_rows = kpis.get("unit_rows") or []
+        if unit_rows:
+            row = unit_rows[0]
+            unit_suffix = f" ({row.get('unit_type')})" if row.get("unit_type") else ""
+            lines.append(f"Unidades reportadas: {row.get('unit_count')}{unit_suffix}")
+        return "\n".join(lines)
+
     def _format_owner_load(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "No encontre propietarios con registros."
@@ -1631,6 +1738,18 @@ class SalesAssistantService:
             f"{row.get('source_type') or '-'} | "
             f"{row.get('interaction_at') or '-'} | "
             f"{row.get('owner_name') or 'Sin responsable'}"
+        )
+
+    def _format_latest_note(self, row: dict[str, Any] | None, owner_scope: str | None) -> str:
+        if not row:
+            owner_label = owner_scope or "el sistema"
+            return f"No encontre notas recientes para {owner_label}."
+        snippet = (row.get("content_text") or "").replace("\n", " ").strip()
+        return (
+            f"Ultima nota registrada: {row.get('created_time') or '-'} | "
+            f"{row.get('parent_name') or 'Sin cliente'} | "
+            f"{row.get('owner_name') or 'Sin responsable'} | "
+            f"{snippet[:220]}"
         )
 
     def _format_today_call_list(self, rows: list[dict[str, Any]]) -> str:

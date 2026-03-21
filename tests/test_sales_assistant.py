@@ -21,6 +21,18 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("movimex", answer)
         self.assertIn("gps@movimex.mx", answer)
 
+    def test_bare_client_name_returns_client_context(self) -> None:
+        response = self.service.answer_question("movimex")
+        answer = response.answer.lower()
+        self.assertIn("movimex", answer)
+        self.assertNotIn("no hay informacion registrada", answer)
+
+    def test_client_weekly_kpi_should_not_be_treated_as_owner_kpi(self) -> None:
+        response = self.service.answer_question("kpi movimex de la semana")
+        answer = response.answer.lower()
+        self.assertIn("movimex", answer)
+        self.assertIn("indicadores comerciales", answer)
+
     def test_today_call_list_is_scoped_to_logged_seller(self) -> None:
         response = self.service.answer_question("a quien debo llamar hoy y por que", user=self.emeza)
         answer = response.answer.lower()
