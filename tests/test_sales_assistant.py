@@ -82,6 +82,30 @@ class SalesAssistantServiceTests(unittest.TestCase):
         intent = classify_question("ultima nota agregada")
         self.assertTrue(intent.asks_for_latest_note)
 
+    def test_sales_email_draft_query_should_be_detected(self) -> None:
+        intent = classify_question(
+            "dame un correo electronico para mandarle a movimex, usa todo lo que sabes para tratar de lograr una venta"
+        )
+        self.assertTrue(intent.asks_for_sales_draft)
+
+    def test_sales_email_draft_formatter_uses_context(self) -> None:
+        draft = self.service._sales_draft(
+            "dame un correo electronico para mandarle a movimex",
+            {
+                "entity_term": "movimex",
+                "latest_row": {"company_name": "Movimex", "giro": "Logistica", "unit_count": 25, "unit_type": "vehiculos"},
+                "contacts": [{"label": "Dena Salinas", "email": "dena.salinas@movimex.com", "phone": "662 214 2253"}],
+                "recent_notes": [{"content_text": "Hubo visita y quieren demo. Actualmente usan gps y buscan seguimiento por whatsapp."}],
+                "document_chunks": [{"file_name": "brochure.pdf", "content": "Soluciones de rastreo y monitoreo."}],
+                "insights": {"signals": ["Hay actividad comercial real y conversacion activa en notas recientes."], "next_step": "Buscar cierre de fecha para demo o validacion operativa."},
+            },
+        )
+        answer = self.service._format_sales_draft(draft).lower()
+        self.assertIn("borrador de correo", answer)
+        self.assertIn("movimex", answer)
+        self.assertIn("asunto:", answer)
+        self.assertIn("dena.salinas@movimex.com", answer)
+
     def test_owner_comparison_returns_metrics_for_both_sellers(self) -> None:
         response = self.service.answer_question("diferencias entre emmanuel y pablo melin")
         answer = response.answer.lower()

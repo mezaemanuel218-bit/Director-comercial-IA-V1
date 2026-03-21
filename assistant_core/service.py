@@ -218,6 +218,7 @@ class SalesAssistantService:
             "entity_brief",
             "owner_brief",
             "team_brief",
+            "sales_draft",
             "today_call_list",
             "comparison_candidates",
             "owner_comparison",
@@ -273,6 +274,10 @@ class SalesAssistantService:
                 effective_owner = owner_scope or self._owner_scope_from_question(conn, question)
                 evidence["owner_brief"] = self._owner_brief(conn, effective_owner)
                 evidence["direct_answer"] = self._format_owner_brief(evidence["owner_brief"], effective_owner)
+            elif entity_term and intent.asks_for_sales_draft:
+                evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
+                evidence["sales_draft"] = self._sales_draft(question, evidence["entity_brief"])
+                evidence["direct_answer"] = self._format_sales_draft(evidence["sales_draft"])
             elif entity_term and intent.asks_for_client_brief:
                 evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
                 evidence["direct_answer"] = self._format_entity_brief(evidence["entity_brief"])
@@ -381,6 +386,16 @@ class SalesAssistantService:
 
     def _extract_entity_hint(self, question: str) -> str | None:
         normalized = self._normalize_search_text(question)
+        sales_patterns = [
+            r"(?:mandarle|enviarle|escribirle)\s+a\s+(.+?)(?:,|$)",
+            r"(?:correo|mail|email|mensaje)\s+(?:para|a)\s+(.+?)(?:,|$)",
+        ]
+        for pattern in sales_patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if match:
+                candidate = self._clean_search_term(match.group(1).strip(" ?.:"))
+                if candidate:
+                    return candidate
         if " de " in normalized and any(token in normalized for token in ["correo", "telefono", "numero", "nombre", "contacto"]):
             trailing = self._clean_search_term(normalized.rsplit(" de ", 1)[-1].strip(" ?.:"))
             if trailing and trailing not in {"la semana", "semana"}:
@@ -734,6 +749,94 @@ class SalesAssistantService:
             "signals": signals[:3],
             "objections": objections[:3],
             "next_step": next_step,
+        }
+
+    def _sales_draft(self, question: str, brief: dict[str, Any]) -> dict[str, Any]:
+        if not brief:
+            return {}
+        latest = brief.get("latest_row") or {}
+        entity_label = (
+            latest.get("company_name")
+            or latest.get("contact_name")
+            or latest.get("full_name")
+            or brief.get("entity_term")
+            or "la cuenta solicitada"
+        )
+        contacts = brief.get("contacts") or []
+        notes = brief.get("recent_notes") or []
+        docs = brief.get("document_chunks") or []
+        insights = brief.get("insights") or {}
+
+        preferred_contact = next(
+            (row for row in contacts if row.get("email") and row.get("email") != "Sin correo"),
+            contacts[0] if contacts else None,
+        )
+        recipient_name = preferred_contact.get("label") if preferred_contact else f"equipo de {entity_label}"
+        recipient_email = preferred_contact.get("email") if preferred_contact else None
+
+        note_text = " || ".join((note.get("content_text") or "") for note in notes).lower()
+        value_points: list[str] = []
+        unit_count = latest.get("unit_count")
+        if unit_count and any(char.isdigit() for char in str(unit_count)):
+            unit_suffix = f" {latest.get('unit_type')}" if latest.get("unit_type") else ""
+            value_points.append(f"una propuesta alineada a una operacion de {unit_count} unidades{unit_suffix}")
+        if any("whatsapp" in (note.get("content_text") or "").lower() for note in notes):
+            value_points.append("seguimiento agil por WhatsApp para acelerar coordinacion")
+        if docs:
+            value_points.append("respaldo con informacion tecnica y operativa de soluciones Flotimatics")
+        if not value_points:
+            value_points.append("una propuesta enfocada en visibilidad operativa, seguimiento y control comercial")
+
+        product_focus: list[str] = []
+        if any(token in note_text for token in ["demo", "reuni", "visita", "seguimiento"]):
+            product_focus.append("una demo aterrizada a su operacion")
+        if any(token in note_text for token in ["vehiculo", "unidades", "flota", "rastreo", "gps"]):
+            product_focus.append("rastreo y monitoreo de flota")
+        if any(token in note_text for token in ["google", "ya tienen", "actual"]):
+            product_focus.append("mejoras frente a su esquema actual de seguimiento")
+        if not product_focus:
+            product_focus.extend(["rastreo y monitoreo de flota", "control operativo y seguimiento comercial"])
+
+        subject = f"Seguimiento {entity_label}: propuesta Flotimatics"
+        if any(token in note_text for token in ["demo", "visita", "reuni"]):
+            subject = f"Seguimiento a conversacion con {entity_label}"
+
+        intro = f"Hola {recipient_name},"
+        body_lines = [
+            intro,
+            "",
+            f"Quiero retomar la conversacion con {entity_label} para proponerte una siguiente etapa clara con Flotimatics.",
+            f"Con base en lo que ya vimos, te podemos ayudar con {', '.join(product_focus[:2])}.",
+            f"La idea es presentarte {value_points[0]} y revisar contigo el siguiente paso que mas valor les daria.",
+        ]
+        if len(value_points) > 1:
+            body_lines.append(f"Tambien podemos sumar {value_points[1]}.")
+        if insights.get("signals"):
+            signal = str(insights["signals"][0]).strip().rstrip(".")
+            body_lines.append(f"Vemos buen contexto para avanzar porque {signal.lower()}.")
+        if insights.get("next_step"):
+            next_step = str(insights["next_step"]).rstrip(".")
+            body_lines.append(f"Mi recomendacion es {next_step}.")
+        body_lines.extend(
+            [
+                "",
+                "Si te hace sentido, te propongo agendar una llamada o demo corta esta semana para revisar su operacion y aterrizar una propuesta puntual.",
+                "",
+                "Quedo atento.",
+                "Saludos,",
+                "Equipo comercial Flotimatics",
+            ]
+        )
+
+        return {
+            "entity_name": entity_label,
+            "recipient_name": recipient_name,
+            "recipient_email": recipient_email if recipient_email and recipient_email != "Sin correo" else None,
+            "subject": subject,
+            "body": "\n".join(body_lines).strip(),
+            "contacts": contacts[:4],
+            "insights": insights,
+            "question": question,
         }
 
     def _entity_kpis(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> dict[str, Any]:
@@ -1638,6 +1741,28 @@ class SalesAssistantService:
                 lines.append(f"- {risk}")
         return "\n".join(lines)
 
+    def _format_sales_draft(self, draft: dict[str, Any]) -> str:
+        if not draft:
+            return "No encontre suficiente contexto para redactar un correo comercial util."
+        lines = [f"Borrador de correo para {draft.get('entity_name') or 'la cuenta solicitada'}"]
+        if draft.get("recipient_email"):
+            lines.append(f"Para sugerido: {draft['recipient_email']}")
+        elif draft.get("recipient_name"):
+            lines.append(f"Contacto sugerido: {draft['recipient_name']}")
+        lines.append(f"Asunto: {draft.get('subject') or 'Seguimiento comercial Flotimatics'}")
+        lines.append("")
+        lines.append(draft.get("body") or "")
+
+        contacts = draft.get("contacts") or []
+        if contacts:
+            lines.append("")
+            lines.append("Contactos disponibles para enviarlo:")
+            for row in contacts[:4]:
+                lines.append(
+                    f"- {row.get('label') or 'Sin nombre'} | {row.get('email') or 'Sin correo'} | {row.get('phone') or 'Sin telefono'}"
+                )
+        return "\n".join(lines)
+
     def _format_owner_brief(self, brief: dict[str, Any], owner_scope: str | None) -> str:
         if not brief:
             owner_label = owner_scope or "el vendedor solicitado"
@@ -2012,6 +2137,8 @@ class SalesAssistantService:
         direct_answer = evidence.get("direct_answer")
         if direct_answer:
             sections.append(direct_answer)
+        elif evidence.get("sales_draft"):
+            sections.append(self._format_sales_draft(evidence["sales_draft"]))
         elif evidence.get("entity_brief"):
             sections.append(self._format_entity_brief(evidence["entity_brief"]))
         elif evidence.get("owner_brief"):
@@ -2059,6 +2186,7 @@ class SalesAssistantService:
             f"Resumen cliente: {evidence.get('entity_brief')}",
             f"Resumen vendedor: {evidence.get('owner_brief')}",
             f"Resumen equipo: {evidence.get('team_brief')}",
+            f"Borrador comercial sugerido: {evidence.get('sales_draft')}",
             "Coincidencias CRM:\n" + serialize_rows(evidence.get("matches", [])),
             "Contactos detectados:\n" + serialize_rows(evidence.get("contact_rows", [])),
             "Interacciones recientes:\n" + serialize_rows(evidence.get("recent_interactions", [])),

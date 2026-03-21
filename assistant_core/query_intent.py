@@ -23,6 +23,7 @@ class QuestionIntent:
     asks_for_client_brief: bool
     asks_for_owner_brief: bool
     asks_for_team_brief: bool
+    asks_for_sales_draft: bool
     asks_for_owner_load: bool
     asks_for_assigned_clients: bool
     asks_for_interactions_by_owner: bool
@@ -51,6 +52,10 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_names = any(token in q for token in ["nombre", "nombres", "persona", "personas", "contacto", "contactos"])
     asks_for_phones = any(token in q for token in ["telefono", "telefonos", "numero", "numeros", "celular", "movil"])
     asks_for_contact_directory = any(token in q for token in ["contacto", "contactos"]) and any(token in q for token in [" de ", " del ", ":"])
+    asks_for_sales_draft = (
+        any(token in q for token in ["correo", "mail", "email", "mensaje", "whatsapp", "propuesta"])
+        and any(token in q for token in ["mandarle", "mandar", "redacta", "redactame", "escribe", "borrador", "draft", "usa todo lo que sabes"])
+    )
     asks_for_client_brief = (
         any(token in q for token in [
             "todo lo que debo saber",
@@ -174,6 +179,7 @@ def classify_question(question: str) -> QuestionIntent:
         asks_for_client_brief=asks_for_client_brief,
         asks_for_owner_brief=asks_for_owner_brief,
         asks_for_team_brief=asks_for_team_brief,
+        asks_for_sales_draft=asks_for_sales_draft,
         asks_for_owner_load=asks_for_owner_load,
         asks_for_assigned_clients=asks_for_assigned_clients,
         asks_for_interactions_by_owner=asks_for_interactions_by_owner,
