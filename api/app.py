@@ -163,6 +163,7 @@ class UserResponse(BaseModel):
     username: str
     display_name: str
     role: str
+    title: str
     crm_owner_name: str | None = None
 
 
@@ -171,6 +172,7 @@ def _to_user_response(user: AppUser) -> UserResponse:
         username=user.username,
         display_name=user.display_name,
         role=user.role,
+        title=user.title,
         crm_owner_name=user.crm_owner_name,
     )
 

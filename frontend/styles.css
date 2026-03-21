@@ -1,14 +1,16 @@
 :root {
-  --bg: #f5efe6;
-  --bg-alt: #fffaf2;
-  --ink: #1e1d1a;
-  --muted: #6b655d;
-  --line: rgba(30, 29, 26, 0.12);
-  --brand: #b6542a;
-  --brand-dark: #8e3f1c;
-  --accent: #e4b363;
-  --panel: rgba(255, 250, 242, 0.92);
-  --shadow: 0 24px 60px rgba(114, 68, 38, 0.12);
+  --bg: #09131f;
+  --bg-alt: #0f2231;
+  --ink: #eef5fb;
+  --muted: #9db0c2;
+  --line: rgba(164, 191, 216, 0.16);
+  --brand: #f47c20;
+  --brand-dark: #c95d08;
+  --accent: #2ec4c7;
+  --panel: rgba(11, 24, 36, 0.84);
+  --panel-soft: rgba(18, 35, 50, 0.82);
+  --surface: rgba(240, 247, 255, 0.06);
+  --shadow: 0 28px 60px rgba(1, 9, 16, 0.42);
 }
 
 * {
@@ -21,9 +23,9 @@ body {
   font-family: "Source Sans 3", sans-serif;
   color: var(--ink);
   background:
-    radial-gradient(circle at top left, rgba(228, 179, 99, 0.26), transparent 32%),
-    radial-gradient(circle at right center, rgba(182, 84, 42, 0.18), transparent 28%),
-    linear-gradient(180deg, #f7f0e5 0%, #efe3d0 100%);
+    radial-gradient(circle at top left, rgba(244, 124, 32, 0.22), transparent 28%),
+    radial-gradient(circle at 80% 10%, rgba(46, 196, 199, 0.18), transparent 20%),
+    linear-gradient(180deg, #08111a 0%, #102638 52%, #0a1824 100%);
 }
 
 .login-overlay {
@@ -42,8 +44,8 @@ body {
   width: min(420px, 100%);
   padding: 28px;
   border-radius: 28px;
-  background: rgba(255, 250, 242, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.5);
+  background: rgba(10, 25, 38, 0.96);
+  border: 1px solid rgba(164, 191, 216, 0.18);
   box-shadow: var(--shadow);
 }
 
@@ -71,7 +73,8 @@ body {
   border: 1px solid var(--line);
   padding: 12px 14px;
   font: inherit;
-  background: rgba(255, 255, 255, 0.84);
+  color: var(--ink);
+  background: rgba(240, 247, 255, 0.08);
 }
 
 .login-button {
@@ -110,6 +113,19 @@ body {
 
 .hero-copy {
   padding: 36px;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero-copy::after {
+  content: "";
+  position: absolute;
+  inset: auto -80px -120px auto;
+  width: 280px;
+  height: 280px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(46, 196, 199, 0.18), transparent 70%);
+  pointer-events: none;
 }
 
 .eyebrow,
@@ -137,12 +153,62 @@ body {
   max-width: 10ch;
 }
 
+.brand-lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.brand-mark {
+  width: 54px;
+  height: 54px;
+  border-radius: 18px;
+  display: grid;
+  place-items: center;
+  gap: 4px;
+  padding: 10px;
+  background: linear-gradient(160deg, rgba(244, 124, 32, 0.2), rgba(46, 196, 199, 0.16));
+  border: 1px solid rgba(244, 124, 32, 0.24);
+}
+
+.brand-mark span {
+  display: block;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--brand), var(--accent));
+}
+
+.brand-subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.98rem;
+  font-weight: 600;
+}
+
 .hero-text {
   max-width: 58ch;
   margin: 18px 0 0;
   font-size: 1.15rem;
   line-height: 1.55;
   color: var(--muted);
+}
+
+.hero-points {
+  margin-top: 22px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.hero-points span {
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: rgba(240, 247, 255, 0.08);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  font-weight: 700;
 }
 
 .hero-panel {
@@ -154,8 +220,8 @@ body {
 .status-card {
   padding: 22px;
   border-radius: 22px;
-  background: rgba(255, 255, 255, 0.78);
-  border: 1px solid rgba(182, 84, 42, 0.12);
+  background: var(--surface);
+  border: 1px solid rgba(244, 124, 32, 0.12);
 }
 
 .status-card strong {
@@ -171,7 +237,7 @@ body {
 }
 
 .status-card.accent {
-  background: linear-gradient(135deg, rgba(228, 179, 99, 0.26), rgba(255, 255, 255, 0.88));
+  background: linear-gradient(135deg, rgba(244, 124, 32, 0.18), rgba(46, 196, 199, 0.12));
 }
 
 .workspace {
@@ -243,11 +309,11 @@ button:hover {
 .primary-button {
   background: linear-gradient(135deg, var(--brand), var(--brand-dark));
   color: white;
-  box-shadow: 0 14px 30px rgba(182, 84, 42, 0.22);
+  box-shadow: 0 14px 30px rgba(244, 124, 32, 0.24);
 }
 
 .secondary-button {
-  background: rgba(255, 255, 255, 0.82);
+  background: rgba(240, 247, 255, 0.08);
   color: var(--ink);
   border: 1px solid var(--line);
 }
@@ -272,13 +338,13 @@ textarea {
   font: inherit;
   font-size: 1rem;
   line-height: 1.55;
-  background: rgba(255, 255, 255, 0.76);
+  background: rgba(240, 247, 255, 0.06);
   color: var(--ink);
 }
 
 textarea:focus {
-  outline: 2px solid rgba(182, 84, 42, 0.18);
-  border-color: rgba(182, 84, 42, 0.35);
+  outline: 2px solid rgba(244, 124, 32, 0.2);
+  border-color: rgba(244, 124, 32, 0.35);
 }
 
 .sample-block {
@@ -301,9 +367,9 @@ textarea:focus {
 .sample-chip {
   padding: 10px 14px;
   border-radius: 999px;
-  background: rgba(228, 179, 99, 0.22);
+  background: rgba(240, 247, 255, 0.08);
   color: var(--ink);
-  border: 1px solid rgba(182, 84, 42, 0.14);
+  border: 1px solid rgba(46, 196, 199, 0.16);
   font: inherit;
   font-weight: 600;
 }
@@ -317,7 +383,7 @@ textarea:focus {
 .meta-pill {
   padding: 9px 12px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.78);
+  background: rgba(240, 247, 255, 0.08);
   border: 1px solid var(--line);
   font-family: "Space Grotesk", sans-serif;
   font-size: 0.84rem;
@@ -329,8 +395,8 @@ textarea:focus {
   min-height: 360px;
   border-radius: 22px;
   padding: 20px;
-  background: #fffdf8;
-  border: 1px solid rgba(30, 29, 26, 0.08);
+  background: rgba(6, 16, 26, 0.92);
+  border: 1px solid rgba(46, 196, 199, 0.12);
   color: var(--ink);
   white-space: pre-wrap;
   line-height: 1.55;
@@ -344,8 +410,8 @@ textarea:focus {
   padding: 12px 14px;
   border-radius: 16px;
   font-weight: 700;
-  background: rgba(228, 179, 99, 0.18);
-  border: 1px solid rgba(182, 84, 42, 0.12);
+  background: rgba(244, 124, 32, 0.12);
+  border: 1px solid rgba(244, 124, 32, 0.18);
 }
 
 .feedback-banner.error {
@@ -361,7 +427,7 @@ textarea:focus {
   margin-top: 18px;
   padding: 18px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(240, 247, 255, 0.06);
   border: 1px solid var(--line);
 }
 
@@ -396,7 +462,8 @@ textarea:focus {
   border: 1px solid var(--line);
   padding: 12px 14px;
   font: inherit;
-  background: rgba(255, 255, 255, 0.8);
+  color: var(--ink);
+  background: rgba(240, 247, 255, 0.08);
 }
 
 .stats-strip {
@@ -409,7 +476,7 @@ textarea:focus {
 .mini-stat {
   padding: 18px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.76);
+  background: rgba(240, 247, 255, 0.06);
   border: 1px solid var(--line);
 }
 
@@ -438,7 +505,7 @@ textarea:focus {
 .dashboard-card {
   padding: 18px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.74);
+  background: rgba(240, 247, 255, 0.06);
   border: 1px solid var(--line);
 }
 
@@ -490,17 +557,17 @@ textarea:focus {
 }
 
 .priority-badge.alta {
-  background: rgba(182, 84, 42, 0.16);
-  color: var(--brand-dark);
+  background: rgba(244, 124, 32, 0.18);
+  color: #ffd2ad;
 }
 
 .priority-badge.media {
-  background: rgba(228, 179, 99, 0.24);
-  color: #7a5612;
+  background: rgba(46, 196, 199, 0.16);
+  color: #b6fbfd;
 }
 
 .priority-badge.normal {
-  background: rgba(30, 29, 26, 0.08);
+  background: rgba(240, 247, 255, 0.08);
   color: var(--ink);
 }
 
@@ -512,7 +579,7 @@ textarea:focus {
 .history-item {
   padding: 16px;
   border-radius: 18px;
-  background: rgba(255, 255, 255, 0.76);
+  background: rgba(240, 247, 255, 0.06);
   border: 1px solid var(--line);
 }
 

@@ -102,7 +102,8 @@ async function fetchCurrentUser() {
     }
     const data = await readJsonSafely(response);
     sessionUser.textContent = data.display_name;
-    sessionDetail.textContent = `Usuario activo: ${data.username}`;
+    const roleDetail = data.title ? ` | ${data.title}` : "";
+    sessionDetail.textContent = `Usuario activo: ${data.username}${roleDetail}`;
     logoutButton.classList.remove("hidden");
     loginOverlay.classList.add("hidden");
     return data;
@@ -180,7 +181,7 @@ async function askQuestion() {
   clearBanner();
   askButton.disabled = true;
   askButton.textContent = "Consultando...";
-  answerOutput.textContent = "Pensando y reuniendo evidencia...";
+  answerOutput.textContent = "Analizando CRM, notas y documentos para responder con evidencia...";
 
   try {
     const response = await fetch("/ask", {

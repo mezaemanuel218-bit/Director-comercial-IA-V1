@@ -33,12 +33,28 @@
   <div class="page-shell">
     <header class="hero">
       <div class="hero-copy">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <div>
+            <p class="eyebrow">Flotimatics</p>
+            <p class="brand-subtitle">Sales Intelligence Console</p>
+          </div>
+        </div>
         <p class="eyebrow">Flotimatics Sales Intelligence</p>
         <h1>Director Comercial IA</h1>
         <p class="hero-text">
-          Asistente comercial conectado a Zoho y a tus documentos internos.
-          Haz preguntas operativas, pide estrategia y refresca la informacion cuando lo necesites.
+          Asistente comercial para operar cartera, analizar vendedores, entender clientes
+          y aterrizar estrategia usando Zoho CRM, notas historicas y documentos internos.
         </p>
+        <div class="hero-points">
+          <span>KPI individual y de equipo</span>
+          <span>Resumen completo por cliente</span>
+          <span>Notas, llamadas y compromisos</span>
+        </div>
       </div>
       <div class="hero-panel">
         <div class="status-card">
@@ -48,8 +64,8 @@
         </div>
         <div class="status-card accent">
           <span class="status-label">Fuentes</span>
-          <strong>Zoho + PDFs</strong>
-          <p>La web solo debe usarse cuando se indique o se declare explicitamente.</p>
+          <strong>Zoho CRM + PDFs internos</strong>
+          <p>El asistente prioriza evidencia comercial interna y solo usa web cuando se solicite.</p>
         </div>
         <div class="status-card">
           <span class="status-label">Sesion</span>
@@ -65,7 +81,7 @@
         <div class="panel-head">
           <div>
             <p class="panel-kicker">Consulta</p>
-            <h2>Preguntale al asistente</h2>
+            <h2>Consulta libre al asistente</h2>
           </div>
           <div class="panel-actions">
             <button id="refreshButton" class="secondary-button">Actualizar Zoho ahora</button>
@@ -74,17 +90,17 @@
         </div>
 
         <label class="input-label" for="questionInput">Escribe tu pregunta</label>
-        <textarea id="questionInput" placeholder="Ejemplo: a quien debo llamar hoy y por que"></textarea>
+        <textarea id="questionInput" placeholder="Ejemplo: dame todo lo que debo saber de TUM, incluyendo unidades, contactos, historial, pendientes y siguiente paso comercial"></textarea>
 
         <div class="sample-block">
-          <span>Ideas rapidas</span>
+          <span>Ideas reales de uso</span>
           <div class="sample-grid">
-            <button class="sample-chip" data-question="dame los correos de Hieleria Veracruz">Correos de un cliente</button>
-            <button class="sample-chip" data-question="a quien le hable ayer">Interacciones de ayer</button>
-            <button class="sample-chip" data-question="dame compromisos pendientes para hoy">Pendientes de hoy</button>
-            <button class="sample-chip" data-question="quien tiene mas clientes asignados">Carga por vendedor</button>
-            <button class="sample-chip" data-question="a quien debo llamar hoy y por que">Siguiente llamada</button>
-            <button class="sample-chip" data-question="compara Hieleria Veracruz vs Servicios y Minas de Mexico Actus">Comparativa comercial</button>
+            <button class="sample-chip" data-question="dame todo lo que debo saber de mis contactos o leads">Mi cartera resumida</button>
+            <button class="sample-chip" data-question="dame todo lo que debo saber de Hieleria Veracruz">Resumen completo de cliente</button>
+            <button class="sample-chip" data-question="kpi mio de la semana">Mi KPI semanal</button>
+            <button class="sample-chip" data-question="kpi global">KPI del equipo</button>
+            <button class="sample-chip" data-question="dame clientes calientes y clientes frios">Calientes y frios</button>
+            <button class="sample-chip" data-question="diferencias entre emmanuel y pablo melin">Comparativa de vendedores</button>
           </div>
         </div>
       </section>
@@ -106,7 +122,7 @@
         <pre id="answerOutput" class="answer-output">Aqui aparecera la respuesta.</pre>
 
         <div class="refresh-summary">
-          <h3>Ultima actualizacion manual</h3>
+          <h3>Estado de sincronizacion</h3>
           <div id="refreshOutput">Todavia no se ha ejecutado una actualizacion desde la interfaz.</div>
         </div>
       </section>

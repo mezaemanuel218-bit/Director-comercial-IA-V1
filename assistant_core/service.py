@@ -215,6 +215,9 @@ class SalesAssistantService:
         if intent.mode == "data":
             return True
         structured_keys = [
+            "entity_brief",
+            "owner_brief",
+            "team_brief",
             "today_call_list",
             "comparison_candidates",
             "owner_comparison",
@@ -257,7 +260,17 @@ class SalesAssistantService:
                 evidence["recent_notes"] = self._recent_notes_for_entity(conn, entity_term, owner_scope=owner_scope)
                 evidence["contact_rows"] = [row.__dict__ for row in self._contact_rows_for_entity(conn, entity_term, owner_scope=owner_scope)]
 
-            if entity_term and (intent.asks_for_contact_directory or (intent.asks_for_names and intent.asks_for_phones)):
+            if intent.asks_for_team_brief:
+                evidence["team_brief"] = self._team_brief(conn)
+                evidence["direct_answer"] = self._format_team_brief(evidence["team_brief"])
+            elif intent.asks_for_owner_brief:
+                effective_owner = owner_scope or self._owner_scope_from_question(conn, question)
+                evidence["owner_brief"] = self._owner_brief(conn, effective_owner)
+                evidence["direct_answer"] = self._format_owner_brief(evidence["owner_brief"], effective_owner)
+            elif entity_term and intent.asks_for_client_brief:
+                evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
+                evidence["direct_answer"] = self._format_entity_brief(evidence["entity_brief"])
+            elif entity_term and (intent.asks_for_contact_directory or (intent.asks_for_names and intent.asks_for_phones)):
                 evidence["direct_answer"] = self._contact_directory_for_entity(conn, entity_term, owner_scope=owner_scope)
             elif entity_term and intent.asks_for_names and intent.asks_for_emails:
                 evidence["direct_answer"] = self._contact_points_for_entity(conn, entity_term, owner_scope=owner_scope)
@@ -477,6 +490,184 @@ class SalesAssistantService:
             )
         )
         return rows
+
+    def _entity_profile_rows(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> list[dict[str, Any]]:
+        wildcard = f"%{self._clean_search_term(term)}%"
+        query = """
+        SELECT *
+        FROM (
+            SELECT
+                'lead' AS entity_type,
+                id,
+                owner_name,
+                company_name,
+                contact_name,
+                full_name,
+                email,
+                phone,
+                city,
+                state,
+                address,
+                website,
+                giro,
+                otros_datos,
+                unit_count,
+                unit_type,
+                phase,
+                last_activity_time,
+                created_time,
+                modified_time
+            FROM leads
+            UNION ALL
+            SELECT
+                'contact' AS entity_type,
+                id,
+                owner_name,
+                company_name,
+                contact_name,
+                full_name,
+                email,
+                phone,
+                city,
+                state,
+                address,
+                website,
+                giro,
+                otros_datos,
+                unit_count,
+                unit_type,
+                phase,
+                last_activity_time,
+                created_time,
+                modified_time
+            FROM contacts
+        )
+        WHERE (
+            lower(coalesce(company_name, '')) LIKE lower(?)
+            OR lower(coalesce(contact_name, '')) LIKE lower(?)
+            OR lower(coalesce(full_name, '')) LIKE lower(?)
+            OR lower(coalesce(email, '')) LIKE lower(?)
+            OR lower(coalesce(phone, '')) LIKE lower(?)
+        )
+        """
+        params: list[Any] = [wildcard, wildcard, wildcard, wildcard, wildcard]
+        if owner_scope:
+            query += " AND owner_name = ?"
+            params.append(owner_scope)
+        query += " ORDER BY last_activity_time DESC, modified_time DESC LIMIT 8"
+        return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def _entity_pending_tasks(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> list[dict[str, Any]]:
+        wildcard = f"%{self._clean_search_term(term)}%"
+        query = """
+        SELECT owner_name, contact_name, subject, status, priority, due_date, description
+        FROM tasks
+        WHERE (status IS NULL OR lower(status) NOT IN ('completed', 'cancelled'))
+          AND (
+              lower(coalesce(contact_name, '')) LIKE lower(?)
+              OR lower(coalesce(subject, '')) LIKE lower(?)
+              OR lower(coalesce(description, '')) LIKE lower(?)
+          )
+        """
+        params: list[Any] = [wildcard, wildcard, wildcard]
+        if owner_scope:
+            query += " AND owner_name = ?"
+            params.append(owner_scope)
+        query += " ORDER BY due_date ASC, owner_name LIMIT 8"
+        return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def _recent_notes_by_owner(self, conn: sqlite3.Connection, owner_scope: str | None, limit: int = 6) -> list[dict[str, Any]]:
+        if not owner_scope:
+            return []
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT parent_name, created_time, title, content_text
+                FROM notes
+                WHERE owner_name = ?
+                ORDER BY created_time DESC
+                LIMIT ?
+                """,
+                [owner_scope, limit],
+            ).fetchall()
+        ]
+
+    def _entity_brief(
+        self,
+        conn: sqlite3.Connection,
+        term: str,
+        owner_scope: str | None = None,
+        question: str | None = None,
+    ) -> dict[str, Any]:
+        profiles = self._entity_profile_rows(conn, term, owner_scope=owner_scope)
+        contacts = [row.__dict__ for row in self._contact_rows_for_entity(conn, term, owner_scope=owner_scope)]
+        interactions = self._recent_interactions_for_entity(conn, term, owner_scope=owner_scope)
+        notes = self._recent_notes_for_entity(conn, term, owner_scope=owner_scope)
+        pending = self._entity_pending_tasks(conn, term, owner_scope=owner_scope)
+        risks = self._risk_profile(conn, term, owner_scope=owner_scope)
+        docs = self._document_search(conn, question or term, term)
+
+        owners = sorted({row.get("owner_name") for row in profiles if row.get("owner_name")})
+        phases = sorted({row.get("phase") for row in profiles if row.get("phase")})
+        unit_rows = [row for row in profiles if row.get("unit_count")]
+        latest_row = profiles[0] if profiles else {}
+        return {
+            "entity_term": term,
+            "profiles": profiles,
+            "owners": owners,
+            "phases": phases,
+            "unit_rows": unit_rows,
+            "latest_row": latest_row,
+            "contacts": contacts[:8],
+            "recent_interactions": interactions[:8],
+            "recent_notes": notes[:8],
+            "pending_tasks": pending[:6],
+            "document_chunks": docs[:4],
+            "risk_profile": risks,
+        }
+
+    def _owner_brief(self, conn: sqlite3.Connection, owner_scope: str | None) -> dict[str, Any]:
+        if not owner_scope:
+            return {}
+        kpis = self._owner_kpis(conn, owner_scope)
+        weekly_kpis = self._owner_kpis(conn, owner_scope, window_days=7)
+        assigned_clients = self._assigned_clients(conn, owner_scope)
+        pending_tasks = self._pending_tasks(conn, owner_scope)
+        stale_contacts = self._stale_contacts(conn, owner_scope)
+        recent_activity = self._recent_activity_by_owner(conn, owner_scope)
+        priorities = self.get_priority_followups(owner=owner_scope, limit=6)
+        recent_notes = self._recent_notes_by_owner(conn, owner_scope)
+        return {
+            "owner_name": owner_scope,
+            "kpis": kpis,
+            "weekly_kpis": weekly_kpis,
+            "assigned_clients": assigned_clients[:8],
+            "assigned_clients_count": len(assigned_clients),
+            "pending_tasks": pending_tasks[:6],
+            "stale_contacts": stale_contacts[:6],
+            "recent_activity": recent_activity[:6],
+            "priorities": priorities[:6],
+            "recent_notes": recent_notes[:5],
+        }
+
+    def _team_brief(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        global_kpis = self._global_kpis(conn)
+        weekly_kpis = self._global_kpis(conn, window_days=7)
+        owner_load = self._owner_load(conn)
+        pending_tasks = self._pending_tasks(conn)
+        stale_contacts = self._stale_contacts(conn)
+        recent_activity = self._recent_activity_by_owner(conn, None)
+        priorities = self.get_priority_followups(limit=8)
+        return {
+            "global_kpis": global_kpis,
+            "weekly_kpis": weekly_kpis,
+            "owner_load": owner_load[:10],
+            "pending_tasks": pending_tasks[:6],
+            "stale_contacts": stale_contacts[:6],
+            "recent_activity": recent_activity[:6],
+            "priorities": priorities[:6],
+        }
 
     def _extract_contacts_from_note(self, note: dict[str, Any]) -> list[ContactRow]:
         content = strip_html(note.get("content_text") or note.get("content_raw") or "")
@@ -927,7 +1118,11 @@ class SalesAssistantService:
                 aliases[key] = user.crm_owner_name
 
         with self._connect() as conn:
-            for row in conn.execute("SELECT DISTINCT name FROM owners WHERE name IS NOT NULL").fetchall():
+            try:
+                rows = conn.execute("SELECT DISTINCT name FROM owners WHERE name IS NOT NULL").fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            for row in rows:
                 owner_name = row[0]
                 key = self._normalize_search_text(owner_name)
                 aliases[key] = owner_name
@@ -959,6 +1154,10 @@ class SalesAssistantService:
             self_scope_signals = [
                 " mi ",
                 " mis ",
+                " mio ",
+                " mia ",
+                " mios ",
+                " mias ",
                 " conmigo ",
                 " yo ",
                 " debo ",
@@ -984,9 +1183,15 @@ class SalesAssistantService:
             "interacciones de ayer",
             "interacciones de antier",
             "actividad reciente",
+            "kpi mio",
+            "mis kpis",
+            "mis contactos",
+            "mis leads",
             "mis clientes",
             "mis prospectos",
             "mi cartera",
+            "clientes calientes",
+            "clientes frios",
         ]
         if any(self._normalize_search_text(signal) in normalized for signal in seller_default_signals):
             return user.crm_owner_name
@@ -996,7 +1201,7 @@ class SalesAssistantService:
         if not owner_scope:
             return question
         normalized = self._normalize_search_text(question)
-        if any(token in f" {normalized} " for token in [" mi ", " mis ", " yo ", " conmigo "]):
+        if any(token in f" {normalized} " for token in [" mi ", " mis ", " mio ", " mia ", " mios ", " mias ", " yo ", " conmigo "]):
             return f"{question.strip()} del vendedor {owner_scope}"
         return question
 
@@ -1019,6 +1224,7 @@ class SalesAssistantService:
             "username": user.username,
             "display_name": user.display_name,
             "role": user.role,
+            "title": user.title,
             "crm_owner_name": user.crm_owner_name,
         }
 
@@ -1180,6 +1386,177 @@ class SalesAssistantService:
             filters.append("date(interaction_at) >= date(?)")
             params.append((datetime.now().date() - timedelta(days=window_days)).isoformat())
         return f"WHERE {' AND '.join(filters)}", params
+
+    def _format_entity_brief(self, brief: dict[str, Any]) -> str:
+        if not brief:
+            return "No encontre evidencia suficiente para armar un resumen comercial."
+        latest = brief.get("latest_row") or {}
+        entity_label = (
+            latest.get("company_name")
+            or latest.get("contact_name")
+            or latest.get("full_name")
+            or brief.get("entity_term")
+            or "la cuenta solicitada"
+        )
+        lines = [f"Resumen comercial de {entity_label}"]
+        owners = brief.get("owners") or []
+        phases = brief.get("phases") or []
+        if owners:
+            lines.append(f"Responsables detectados: {', '.join(owners)}")
+        if phases:
+            lines.append(f"Fase comercial: {', '.join(phases)}")
+        if latest.get("giro"):
+            lines.append(f"Giro: {latest['giro']}")
+        if latest.get("unit_count"):
+            unit_suffix = f" ({latest.get('unit_type')})" if latest.get("unit_type") else ""
+            lines.append(f"Unidades reportadas: {latest['unit_count']}{unit_suffix}")
+        location = ", ".join(part for part in [latest.get("city"), latest.get("state")] if part)
+        if location:
+            lines.append(f"Ubicacion: {location}")
+        if latest.get("website"):
+            lines.append(f"Sitio: {latest['website']}")
+
+        contacts = brief.get("contacts") or []
+        if contacts:
+            lines.append("")
+            lines.append("Contactos y datos detectados:")
+            for row in contacts[:5]:
+                lines.append(
+                    f"- {row.get('label') or 'Sin nombre'} | {row.get('email') or 'Sin correo'} | {row.get('phone') or 'Sin telefono'}"
+                )
+
+        interactions = brief.get("recent_interactions") or []
+        if interactions:
+            lines.append("")
+            lines.append("Interacciones recientes:")
+            for row in interactions[:5]:
+                summary = row.get("summary") or row.get("status") or "-"
+                lines.append(
+                    f"- {row.get('interaction_at') or '-'} | {row.get('source_type') or '-'} | {summary[:140]}"
+                )
+
+        pending = brief.get("pending_tasks") or []
+        if pending:
+            lines.append("")
+            lines.append("Compromisos abiertos:")
+            for row in pending[:4]:
+                lines.append(
+                    f"- {row.get('due_date') or 'Sin fecha'} | {row.get('subject') or 'Sin asunto'} | {row.get('status') or 'Sin estatus'}"
+                )
+
+        notes = brief.get("recent_notes") or []
+        if notes:
+            lines.append("")
+            lines.append("Notas clave:")
+            for row in notes[:4]:
+                snippet = (row.get("content_text") or "").replace("\n", " ").strip()
+                lines.append(f"- {row.get('created_time') or '-'} | {snippet[:180]}")
+
+        docs = brief.get("document_chunks") or []
+        if docs:
+            lines.append("")
+            lines.append("Soporte en PDFs:")
+            for chunk in docs[:3]:
+                snippet = (chunk.get("content") or "").replace("\n", " ").strip()
+                lines.append(f"- {chunk.get('file_name') or '-'} | {snippet[:170]}")
+
+        risks = (brief.get("risk_profile") or {}).get("risks") or []
+        if risks:
+            lines.append("")
+            lines.append("Alertas:")
+            for risk in risks[:3]:
+                lines.append(f"- {risk}")
+        return "\n".join(lines)
+
+    def _format_owner_brief(self, brief: dict[str, Any], owner_scope: str | None) -> str:
+        if not brief:
+            owner_label = owner_scope or "el vendedor solicitado"
+            return f"No encontre evidencia suficiente para resumir la cartera de {owner_label}."
+        owner_name = brief.get("owner_name") or owner_scope or "el vendedor"
+        kpis = brief.get("kpis") or {}
+        weekly_kpis = brief.get("weekly_kpis") or {}
+        lines = [
+            f"Panorama comercial de {owner_name}",
+            f"Interacciones totales: {kpis.get('total_interactions', 0)}",
+            f"Cuentas unicas activas: {kpis.get('unique_accounts', 0)}",
+            f"Clientes y prospectos asignados: {brief.get('assigned_clients_count', 0)}",
+            f"Interacciones ultimos 7 dias: {weekly_kpis.get('total_interactions', 0)}",
+        ]
+        by_type = kpis.get("by_type") or []
+        if by_type:
+            lines.append("Mix de actividad: " + ", ".join(f"{row['source_type']} {row['total']}" for row in by_type[:4]))
+
+        priorities = brief.get("priorities") or []
+        if priorities:
+            lines.append("")
+            lines.append("Clientes calientes o de mayor prioridad:")
+            for row in priorities[:4]:
+                reasons = " / ".join(row.get("reasons") or [])
+                lines.append(
+                    f"- {row.get('related_name') or 'Sin nombre'} | prioridad {row.get('priority_label') or '-'} | {reasons[:160]}"
+                )
+
+        stale = brief.get("stale_contacts") or []
+        if stale:
+            lines.append("")
+            lines.append("Clientes frios o rezagados:")
+            for row in stale[:4]:
+                lines.append(f"- {row.get('related_name') or 'Sin nombre'} | ultimo toque {row.get('last_touch') or '-'}")
+
+        pending = brief.get("pending_tasks") or []
+        if pending:
+            lines.append("")
+            lines.append("Compromisos pendientes:")
+            for row in pending[:4]:
+                lines.append(
+                    f"- {row.get('due_date') or 'Sin fecha'} | {row.get('contact_name') or 'Sin contacto'} | {row.get('subject') or 'Sin asunto'}"
+                )
+
+        recent_activity = brief.get("recent_activity") or []
+        if recent_activity:
+            lines.append("")
+            lines.append("Actividad reciente:")
+            for row in recent_activity[:4]:
+                lines.append(
+                    f"- {row.get('interaction_at') or '-'} | {row.get('related_name') or 'Sin nombre'} | {row.get('source_type') or '-'}"
+                )
+        return "\n".join(lines)
+
+    def _format_team_brief(self, brief: dict[str, Any]) -> str:
+        if not brief:
+            return "No encontre evidencia suficiente para resumir al equipo comercial."
+        global_kpis = brief.get("global_kpis") or {}
+        weekly_kpis = brief.get("weekly_kpis") or {}
+        lines = [
+            "Panorama comercial del equipo Flotimatics",
+            f"Interacciones totales: {global_kpis.get('total_interactions', 0)}",
+            f"Cuentas unicas: {global_kpis.get('unique_accounts', 0)}",
+            f"Vendedores con actividad: {global_kpis.get('owners', 0)}",
+            f"Interacciones ultimos 7 dias: {weekly_kpis.get('total_interactions', 0)}",
+        ]
+        by_owner = global_kpis.get("by_owner") or []
+        if by_owner:
+            lines.append("")
+            lines.append("Lideres por actividad:")
+            for row in by_owner[:5]:
+                lines.append(f"- {row['owner_name']}: {row['total']} interacciones")
+
+        owner_load = brief.get("owner_load") or []
+        if owner_load:
+            lines.append("")
+            lines.append("Carga por vendedor:")
+            for row in owner_load[:5]:
+                lines.append(f"- {row['owner_name']}: {row['total_records']} cuentas")
+
+        priorities = brief.get("priorities") or []
+        if priorities:
+            lines.append("")
+            lines.append("Seguimientos prioritarios del equipo:")
+            for row in priorities[:4]:
+                lines.append(
+                    f"- {row.get('related_name') or 'Sin nombre'} | {row.get('owner_name') or 'Sin responsable'} | prioridad {row.get('priority_label') or '-'}"
+                )
+        return "\n".join(lines)
 
     def _format_owner_load(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
@@ -1420,6 +1797,12 @@ class SalesAssistantService:
         direct_answer = evidence.get("direct_answer")
         if direct_answer:
             sections.append(direct_answer)
+        elif evidence.get("entity_brief"):
+            sections.append(self._format_entity_brief(evidence["entity_brief"]))
+        elif evidence.get("owner_brief"):
+            sections.append(self._format_owner_brief(evidence["owner_brief"], evidence.get("owner_scope")))
+        elif evidence.get("team_brief"):
+            sections.append(self._format_team_brief(evidence["team_brief"]))
         if evidence.get("recent_interactions"):
             sections.append("Interacciones recientes:\n" + self._format_interaction_list(evidence["recent_interactions"], ""))
         if evidence.get("recent_notes"):
@@ -1439,11 +1822,13 @@ class SalesAssistantService:
             return "\n".join(f"- {row}" for row in rows[:limit]) if rows else "- Sin registros"
 
         instructions = [
-            "Eres el asistente comercial final del proyecto Director Comercial IA.",
-            "Responde en español claro y ejecutivo.",
+            "Eres el asistente comercial del equipo Flotimatics.",
+            "Ayudas a direccion y vendedores con KPIs, cartera, comparativas, historial de notas, compromisos, llamadas y contexto comercial por cliente.",
+            "Responde en español claro, ejecutivo y accionable.",
             "Usa solo la evidencia proporcionada de Zoho CRM y PDFs locales.",
-            "No inventes contactos, teléfonos, correos, responsables ni conclusiones.",
-            "Si hay duda o falta de evidencia, dilo explícitamente.",
+            "No inventes contactos, teléfonos, correos, responsables, unidades ni conclusiones.",
+            "Si la evidencia es parcial, entrega lo que sí está respaldado y di claramente lo que falta.",
+            "Cuando la pregunta sea amplia, sintetiza primero el panorama y luego baja a datos concretos.",
         ]
         if intent.mode == "data":
             instructions.append("Como la consulta es de datos, responde de forma breve y directa.")
@@ -1456,6 +1841,9 @@ class SalesAssistantService:
             f"Usuario activo: {evidence.get('active_user')}",
             f"Vendedor aplicado: {evidence.get('owner_scope')}",
             f"Entidad detectada: {evidence.get('entity_hint')}",
+            f"Resumen cliente: {evidence.get('entity_brief')}",
+            f"Resumen vendedor: {evidence.get('owner_brief')}",
+            f"Resumen equipo: {evidence.get('team_brief')}",
             "Coincidencias CRM:\n" + serialize_rows(evidence.get("matches", [])),
             "Contactos detectados:\n" + serialize_rows(evidence.get("contact_rows", [])),
             "Interacciones recientes:\n" + serialize_rows(evidence.get("recent_interactions", [])),

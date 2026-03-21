@@ -20,6 +20,9 @@ class QuestionIntent:
     asks_for_names: bool
     asks_for_phones: bool
     asks_for_contact_directory: bool
+    asks_for_client_brief: bool
+    asks_for_owner_brief: bool
+    asks_for_team_brief: bool
     asks_for_owner_load: bool
     asks_for_assigned_clients: bool
     asks_for_interactions_by_owner: bool
@@ -47,6 +50,55 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_names = any(token in q for token in ["nombre", "nombres", "persona", "personas", "contacto", "contactos"])
     asks_for_phones = any(token in q for token in ["telefono", "telefonos", "numero", "numeros", "celular", "movil"])
     asks_for_contact_directory = any(token in q for token in ["contacto", "contactos"]) and any(token in q for token in [" de ", " del ", ":"])
+    asks_for_client_brief = (
+        any(token in q for token in [
+            "todo lo que debo saber",
+            "que debo saber",
+            "resumen del cliente",
+            "resumen del prospecto",
+            "resumen comercial",
+            "estatus del cliente",
+            "historial del cliente",
+            "dame contexto de",
+            "dame contexto comercial de",
+            "que sabes de",
+        ])
+        or (
+            any(token in q for token in ["cliente", "prospecto", "lead", "cuenta", "empresa"])
+            and any(token in q for token in ["resumen", "historial", "estatus", "contexto", "detalle", "detalles"])
+        )
+    )
+    asks_for_owner_brief = any(
+        token in q
+        for token in [
+            "mis contactos o leads",
+            "mis contactos",
+            "mis leads",
+            "mi cartera",
+            "resumen de mi cartera",
+            "resumen del vendedor",
+            "resumen comercial del vendedor",
+            "kpi mio",
+            "mis kpis",
+            "mis logros",
+            "mi actividad comercial",
+            "mis pendientes",
+            "clientes calientes",
+            "clientes frios",
+        ]
+    )
+    asks_for_team_brief = any(
+        token in q
+        for token in [
+            "resumen del equipo",
+            "resumen comercial del equipo",
+            "kpi global",
+            "kpis globales",
+            "logros del equipo",
+            "actividad del equipo",
+            "panorama del equipo",
+        ]
+    )
 
     asks_for_owner_load = (
         (any(token in q for token in ["cuantos clientes", "asignados", "carga"]) and any(token in q for token in ["vendedor", "propietario", "agente", "clientes"]))
@@ -103,6 +155,9 @@ def classify_question(question: str) -> QuestionIntent:
         asks_for_names=asks_for_names,
         asks_for_phones=asks_for_phones,
         asks_for_contact_directory=asks_for_contact_directory,
+        asks_for_client_brief=asks_for_client_brief,
+        asks_for_owner_brief=asks_for_owner_brief,
+        asks_for_team_brief=asks_for_team_brief,
         asks_for_owner_load=asks_for_owner_load,
         asks_for_assigned_clients=asks_for_assigned_clients,
         asks_for_interactions_by_owner=asks_for_interactions_by_owner,

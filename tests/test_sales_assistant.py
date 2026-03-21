@@ -1,4 +1,3 @@
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -49,9 +48,19 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("jesus emmanuel meza", answer)
         self.assertNotIn("interacciones: 0", answer)
 
+    def test_weekly_kpis_for_self_scope_are_resolved(self) -> None:
+        response = self.service.answer_question("kpi mio de la semana", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("jesus emmanuel meza", answer)
+        self.assertIn("ultimos 7 dias", answer)
+
     def test_plural_differences_query_should_be_treated_as_comparison(self) -> None:
         intent = classify_question("diferencias entre emmanuel y pablo melin")
         self.assertTrue(intent.asks_for_comparison)
+
+    def test_open_summary_query_should_be_treated_as_owner_brief(self) -> None:
+        intent = classify_question("dime todo lo que debo saber de mis contactos o leads")
+        self.assertTrue(intent.asks_for_owner_brief)
 
     def test_owner_comparison_returns_metrics_for_both_sellers(self) -> None:
         response = self.service.answer_question("diferencias entre emmanuel y pablo melin")
@@ -60,12 +69,23 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("pablo melin dorador", answer)
         self.assertIn("interacciones", answer)
 
+    def test_owner_brief_lists_hot_and_cold_accounts(self) -> None:
+        response = self.service.answer_question("dame clientes calientes y clientes frios", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("clientes calientes", answer)
+        self.assertIn("clientes frios", answer)
+
 
 class HistoryIsolationTests(unittest.TestCase):
     def test_history_can_be_filtered_by_username(self) -> None:
         original_db = history_module.WAREHOUSE_DB
-        with tempfile.TemporaryDirectory() as tmpdir:
-            history_module.WAREHOUSE_DB = Path(tmpdir) / "history.db"
+        temp_dir = Path("data/test-history")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        history_db = temp_dir / "history.db"
+        if history_db.exists():
+            history_db.unlink()
+        try:
+            history_module.WAREHOUSE_DB = history_db
             ensure_history_schema()
             save_history("q1", "a1", "data", ["warehouse.db"], False, username="emeza")
             save_history("q2", "a2", "data", ["warehouse.db"], False, username="pmelin")
@@ -79,7 +99,10 @@ class HistoryIsolationTests(unittest.TestCase):
             self.assertEqual(emeza_items[0]["username"], "emeza")
             self.assertEqual(pmelin_items[0]["username"], "pmelin")
             self.assertEqual(len(all_items), 2)
-        history_module.WAREHOUSE_DB = original_db
+        finally:
+            history_module.WAREHOUSE_DB = original_db
+            if history_db.exists():
+                history_db.unlink()
 
 
 if __name__ == "__main__":

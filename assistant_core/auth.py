@@ -13,6 +13,7 @@ class AppUser:
     username: str
     display_name: str
     role: str
+    title: str
     crm_owner_name: str | None
     password_hash: str
 
@@ -24,6 +25,7 @@ APP_USERS = {
         username="evaldez",
         display_name="Eduardo Valdez",
         role="seller",
+        title="Director comercial y vendedor",
         crm_owner_name="Eduardo Valdez",
         password_hash=DEFAULT_PASSWORD_HASH,
     ),
@@ -31,6 +33,7 @@ APP_USERS = {
         username="pmelin",
         display_name="Pablo Melin",
         role="seller",
+        title="Vendedor comercial",
         crm_owner_name="Pablo Melin Dorador",
         password_hash=DEFAULT_PASSWORD_HASH,
     ),
@@ -38,6 +41,7 @@ APP_USERS = {
         username="emeza",
         display_name="Emmanuel Meza",
         role="seller",
+        title="Vendedor comercial",
         crm_owner_name="Jesus Emmanuel Meza Guzm\u00e1n",
         password_hash=DEFAULT_PASSWORD_HASH,
     ),
