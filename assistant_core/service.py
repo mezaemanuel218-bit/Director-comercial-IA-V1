@@ -333,12 +333,18 @@ class SalesAssistantService:
             elif intent.asks_for_comparison:
                 owner_names = self._mentioned_owner_names(question)
                 if len(owner_names) >= 2:
-                    evidence["owner_comparison"] = self._owner_comparison(conn, owner_names[:2])
-                    evidence["direct_answer"] = (
-                        self._format_owner_comparison(evidence["owner_comparison"])
-                        if intent.mode == "data"
-                        else self._format_owner_comparison_analysis(evidence["owner_comparison"])
-                    )
+                    if owner_names[0] == owner_names[1]:
+                        evidence["direct_answer"] = (
+                            f"La comparacion apunta al mismo vendedor ({owner_names[0]}). "
+                            "Pide dos vendedores distintos para contrastar actividad, cartera y pendientes."
+                        )
+                    else:
+                        evidence["owner_comparison"] = self._owner_comparison(conn, owner_names[:2])
+                        evidence["direct_answer"] = (
+                            self._format_owner_comparison(evidence["owner_comparison"])
+                            if intent.mode == "data"
+                            else self._format_owner_comparison_analysis(evidence["owner_comparison"])
+                        )
                 else:
                     evidence["comparison_candidates"] = self._comparison_candidates(conn, question, owner_scope)
                     evidence["direct_answer"] = (
@@ -381,6 +387,9 @@ class SalesAssistantService:
                 return trailing
         specific_patterns = [
             r"kpi(?:s)?\s+(.+?)\s+de\s+la\s+semana$",
+            r"que sigue con\s+(.+)$",
+            r"que objeciones?(?:\s+hay)?\s+(?:en|de)\s+(.+)$",
+            r"hazme un resumen ejecutivo de\s+(.+)$",
             r"(?:dame|quiero|necesito)\s+(?:los\s+)?nombres(?:\s*,\s*|\s+y\s+)?(?:correos?|emails?)(?:\s*,\s*|\s+y\s+)?(?:numeros?|telefonos?)\s+de\s+(.+)$",
             r"(?:dame|quiero|necesito)\s+(?:los\s+)?(?:nombres?|correos?|emails?|numeros?|telefonos?)\s+de\s+(.+)$",
         ]
@@ -671,6 +680,60 @@ class SalesAssistantService:
             "pending_tasks": pending[:6],
             "document_chunks": docs[:4],
             "risk_profile": risks,
+            "insights": self._entity_insights(term, latest_row, notes, interactions, pending),
+        }
+
+    def _entity_insights(
+        self,
+        term: str,
+        latest_row: dict[str, Any],
+        notes: list[dict[str, Any]],
+        interactions: list[dict[str, Any]],
+        pending: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        combined = " || ".join((note.get("content_text") or "") for note in notes).lower()
+        signals: list[str] = []
+        objections: list[str] = []
+
+        if any(token in combined for token in ["interes", "interés", "demo", "reuni", "visita", "cotiz", "propuesta"]):
+            signals.append("Hay actividad comercial real y conversacion activa en notas recientes.")
+        if "whatsapp" in combined:
+            signals.append("El canal de seguimiento por WhatsApp aparece como viable.")
+        if any(token in combined for token in ["dueño", "dueno", "decide", "gerente", "coordinador"]):
+            signals.append("Las notas sugieren que ya hay informacion sobre quien influye o decide.")
+
+        if any(token in combined for token in ["no cree", "rechaz", "caro", "objec", "ya tienen", "inversion"]):
+            objections.append("Hay objeciones o resistencia frente al cambio en notas recientes.")
+        if "rebot" in combined:
+            objections.append("Hay correos rebotados o datos de contacto por depurar.")
+
+        if pending:
+            next_step = f"Dar seguimiento al compromiso abierto: {pending[0].get('subject') or 'sin asunto'}."
+        elif "demo" in combined:
+            next_step = "Buscar cierre de fecha para demo o validacion operativa."
+        elif "cotiz" in combined or "propuesta" in combined:
+            next_step = "Dar seguimiento a cotizacion/propuesta y confirmar decision maker."
+        elif "visita" in combined or "reuni" in combined:
+            next_step = "Convertir la ultima conversacion en siguiente accion concreta: demo, propuesta o reunion de seguimiento."
+        elif interactions:
+            next_step = "Retomar el ultimo contacto y pedir siguiente paso claro con fecha."
+        else:
+            next_step = f"Profundizar contexto comercial de {term} con una nueva llamada o nota de descubrimiento."
+
+        status_parts = []
+        if latest_row.get("phase"):
+            status_parts.append(f"fase {latest_row['phase']}")
+        if interactions:
+            status_parts.append(f"{len(interactions)} interacciones recientes")
+        if notes:
+            status_parts.append(f"{len(notes)} notas")
+        status = ", ".join(status_parts) if status_parts else "sin suficiente evidencia estructurada"
+
+        return {
+            "status": status,
+            "signals": signals[:3],
+            "objections": objections[:3],
+            "next_step": next_step,
         }
 
     def _entity_kpis(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> dict[str, Any]:
@@ -1328,12 +1391,28 @@ class SalesAssistantService:
             "contacto ",
             "empresa ",
         ]
+        removable_suffixes = [
+            ", dame solamente eso",
+            " dame solamente eso",
+            ", solamente eso",
+            " solamente eso",
+            ", solo eso",
+            " solo eso",
+            ", nada mas",
+            " nada mas",
+            ", nada más",
+            " nada mas dame eso",
+        ]
         changed = True
         while changed:
             changed = False
             for prefix in removable_prefixes:
                 if cleaned.startswith(prefix):
                     cleaned = cleaned[len(prefix):].strip()
+                    changed = True
+            for suffix in removable_suffixes:
+                if cleaned.endswith(suffix):
+                    cleaned = cleaned[: -len(suffix)].strip(" ,.;:-")
                     changed = True
         return cleaned.strip()
 
@@ -1481,6 +1560,15 @@ class SalesAssistantService:
             or "la cuenta solicitada"
         )
         lines = [f"Resumen comercial de {entity_label}"]
+        insights = brief.get("insights") or {}
+        if insights.get("status"):
+            lines.append(f"Lectura actual: {insights['status']}")
+        if insights.get("signals"):
+            lines.append("Señales comerciales: " + " ".join(insights["signals"]))
+        if insights.get("objections"):
+            lines.append("Objeciones o fricciones: " + " ".join(insights["objections"]))
+        if insights.get("next_step"):
+            lines.append(f"Siguiente paso sugerido: {insights['next_step']}")
         owners = brief.get("owners") or []
         phases = brief.get("phases") or []
         if owners:
@@ -1672,7 +1760,12 @@ class SalesAssistantService:
 
     def _format_assigned_clients(self, rows: list[dict[str, Any]], owner_scope: str | None) -> str:
         if not rows:
-            return f"No encontre clientes o prospectos asignados a {owner_scope}." if owner_scope else "No encontre clientes asignados."
+            if owner_scope:
+                return (
+                    f"No encontre clientes o prospectos asignados a {owner_scope}. "
+                    "Puede significar que su cartera actual no tiene registros visibles en leads/contacts o que el nombre del owner en CRM es distinto."
+                )
+            return "No encontre clientes asignados."
         lines = []
         for row in rows:
             label = row.get("company_name") or row.get("contact_name") or row.get("full_name") or "Sin nombre"
@@ -1692,7 +1785,8 @@ class SalesAssistantService:
 
     def _format_recent_activity_by_owner(self, rows: list[dict[str, Any]], owner_scope: str | None) -> str:
         if not rows:
-            return "No encontre actividad reciente."
+            owner_label = owner_scope or "el equipo"
+            return f"No encontre actividad reciente para {owner_label} en el rango consultado."
         return "\n".join(
             f"{row.get('owner_name') or 'Sin responsable'} | {row.get('related_name') or 'Sin nombre'} | {row.get('source_type') or '-'} | {row.get('interaction_at') or '-'}"
             for row in rows
@@ -1708,7 +1802,7 @@ class SalesAssistantService:
 
     def _format_today_pending(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
-            return "No encontre compromisos pendientes para hoy."
+            return "No encontre compromisos pendientes para hoy. Si esperabas actividad, revisa tareas sin fecha, vencidas o registradas con otro owner."
         return "\n".join(
             f"{row.get('owner_name') or 'Sin responsable'} | {row.get('contact_name') or 'Sin contacto'} | {row.get('subject') or 'Sin asunto'} | {row.get('priority') or 'Sin prioridad'} | {row.get('due_date') or 'Sin fecha'}"
             for row in rows
@@ -1724,7 +1818,9 @@ class SalesAssistantService:
 
     def _format_interaction_list(self, rows: list[dict[str, Any]], fallback: str) -> str:
         if not rows:
-            return fallback
+            if fallback:
+                return fallback + " Si esperabas movimiento, revisa si la actividad se guardo como nota, llamada futura o bajo otro responsable."
+            return "No encontre interacciones para ese criterio."
         return "\n".join(
             f"{row.get('related_name') or 'Sin nombre'} | {row.get('source_type') or '-'} | {row.get('interaction_at') or '-'} | {row.get('owner_name') or 'Sin responsable'}"
             for row in rows

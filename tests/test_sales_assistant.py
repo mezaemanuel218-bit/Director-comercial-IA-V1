@@ -74,6 +74,14 @@ class SalesAssistantServiceTests(unittest.TestCase):
         intent = classify_question("dime todo lo que debo saber de mis contactos o leads")
         self.assertTrue(intent.asks_for_owner_brief)
 
+    def test_recommendation_call_query_should_be_treated_as_today_call_list(self) -> None:
+        intent = classify_question("en base a mis notas a quien me recomiendas llamar hoy")
+        self.assertTrue(intent.asks_for_today_call_list)
+
+    def test_latest_note_query_should_be_detected(self) -> None:
+        intent = classify_question("ultima nota agregada")
+        self.assertTrue(intent.asks_for_latest_note)
+
     def test_owner_comparison_returns_metrics_for_both_sellers(self) -> None:
         response = self.service.answer_question("diferencias entre emmanuel y pablo melin")
         answer = response.answer.lower()

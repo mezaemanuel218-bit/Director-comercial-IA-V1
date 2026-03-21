@@ -63,6 +63,11 @@ def classify_question(question: str) -> QuestionIntent:
             "dame contexto de",
             "dame contexto comercial de",
             "que sabes de",
+            "que sigue con",
+            "siguiente paso de",
+            "objeciones de",
+            "objeciones en",
+            "resumen ejecutivo de",
         ])
         or (
             any(token in q for token in ["cliente", "prospecto", "lead", "cuenta", "empresa"])
@@ -120,15 +125,24 @@ def classify_question(question: str) -> QuestionIntent:
 
     asks_for_interactions_by_owner = "interacciones" in q and any(token in q for token in ["vendedor", "agente", "propietario", "cada"])
     asks_for_generic_relative_interactions = any(token in q for token in ["interacciones", "actividad"]) and any(token in q for token in ["ayer", "antier", "anteayer"])
-    asks_for_recent_activity_by_owner = any(token in q for token in ["actividad reciente", "mas actividad reciente"]) and any(token in q for token in ["quien", "vendedor"])
-    asks_for_risks = "riesgo" in q or "riesgos" in q
+    asks_for_recent_activity_by_owner = any(token in q for token in ["actividad reciente", "mas actividad reciente"]) and any(token in q for token in ["quien", "vendedor", "de "])
+    asks_for_risks = any(token in q for token in ["riesgo", "riesgos", "objecion", "objeciones", "bloqueador", "bloqueadores"])
     asks_for_kpis = "kpi" in q or "kpis" in q or ("metric" in q and any(token in q for token in ["nota", "cliente"]))
     asks_for_global_kpis = asks_for_kpis and any(token in q for token in ["global", "todos", "vendedores", "equipo"])
     asks_for_weekly_window = "semana" in q
     asks_for_last_contact = any(token in q for token in ["ultimo contacto", "ayer", "antier", "anteayer"])
     asks_for_pending_commitments = any(token in q for token in ["compromiso", "pendiente", "tarea"])
     asks_for_stale_contacts = any(token in q for token in ["30 dias", "sin contacto"])
-    asks_for_today_call_list = "a quien debo llamar hoy" in q or "hoy y por que" in q
+    asks_for_today_call_list = (
+        "a quien debo llamar hoy" in q
+        or "hoy y por que" in q
+        or "a quien debo contactar hoy" in q
+        or "a quien me recomiendas llamar hoy" in q
+        or "a quien me recomiendas contactar hoy" in q
+        or "a quien debo darle seguimiento hoy" in q
+        or ("hoy" in q and any(token in q for token in ["llamar", "llame", "contactar", "contacte", "seguimiento"]) and any(token in q for token in ["debo", "recomiendas", "recomiendas", "conviene"]))
+        or ("en base a mis notas" in q and any(token in q for token in ["llamar", "contactar", "seguimiento"]))
+    )
     asks_for_comparison = any(token in q for token in ["compara", "comparativa", " vs ", "diferencia entre", "diferencias entre"])
     wants_web = any(token in q for token in ["web", "internet"])
     asks_for_yesterday_contacts = "ayer" in q and any(token in q for token in ["hable", "llame", "contacte"])
@@ -137,7 +151,7 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "compromiso", "tarea"])
     asks_for_latest_note = any(token in q for token in ["ultima nota", "última nota", "nota agregada", "nota mas reciente", "nota más reciente"])
 
-    analysis_signals = ["plan", "estrategia", "por que", "recomienda", "conviene", "analiza", "compar", "riesgo", "diferencias entre"]
+    analysis_signals = ["plan", "estrategia", "por que", "recomienda", "conviene", "analiza", "compar", "riesgo", "diferencias entre", "en base a mis notas"]
     data_signals = ["solo", "dame", "lista", "correos", "telefonos", "nombres", "ultimo", "kpi", "kpis"]
 
     has_analysis = any(signal in q for signal in analysis_signals)
