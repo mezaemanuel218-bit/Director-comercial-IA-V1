@@ -219,6 +219,8 @@ class SalesAssistantService:
             "owner_brief",
             "team_brief",
             "sales_draft",
+            "action_plan",
+            "sales_material",
             "today_call_list",
             "comparison_candidates",
             "owner_comparison",
@@ -267,7 +269,17 @@ class SalesAssistantService:
                 or evidence.get("contact_rows")
             )
 
-            if intent.asks_for_team_brief:
+            if intent.asks_for_action_plan:
+                if entity_term and entity_has_evidence:
+                    evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
+                    evidence["action_plan"] = self._entity_action_plan(evidence["entity_brief"])
+                    evidence["direct_answer"] = self._format_action_plan(evidence["action_plan"])
+                else:
+                    effective_owner = owner_scope or self._owner_scope_from_question(conn, question)
+                    evidence["owner_brief"] = self._owner_brief(conn, effective_owner)
+                    evidence["action_plan"] = self._owner_action_plan(evidence["owner_brief"], effective_owner)
+                    evidence["direct_answer"] = self._format_action_plan(evidence["action_plan"])
+            elif intent.asks_for_team_brief:
                 evidence["team_brief"] = self._team_brief(conn)
                 evidence["direct_answer"] = self._format_team_brief(evidence["team_brief"])
             elif intent.asks_for_owner_brief:
@@ -278,6 +290,10 @@ class SalesAssistantService:
                 evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
                 evidence["sales_draft"] = self._sales_draft(question, evidence["entity_brief"])
                 evidence["direct_answer"] = self._format_sales_draft(evidence["sales_draft"])
+            elif entity_term and intent.asks_for_sales_material:
+                evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
+                evidence["sales_material"] = self._sales_material(question, evidence["entity_brief"])
+                evidence["direct_answer"] = self._format_sales_material(evidence["sales_material"])
             elif entity_term and intent.asks_for_client_brief:
                 evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
                 evidence["direct_answer"] = self._format_entity_brief(evidence["entity_brief"])
@@ -389,6 +405,9 @@ class SalesAssistantService:
         sales_patterns = [
             r"(?:mandarle|enviarle|escribirle)\s+a\s+(.+?)(?:,|$)",
             r"(?:correo|mail|email|mensaje)\s+(?:para|a)\s+(.+?)(?:,|$)",
+            r"(?:seguimiento|correo|mensaje|propuesta)\s+para\s+(.+?)(?:,|$)",
+            r"(?:llamada|reunion|reunion)\s+con\s+(.+?)(?:,|$)",
+            r"(?:esta semana|hoy|manana|mañana)\s+con\s+(.+?)(?:,|$)",
         ]
         for pattern in sales_patterns:
             match = re.search(pattern, normalized, flags=re.IGNORECASE)
@@ -405,6 +424,8 @@ class SalesAssistantService:
             r"que sigue con\s+(.+)$",
             r"que objeciones?(?:\s+hay)?\s+(?:en|de)\s+(.+)$",
             r"hazme un resumen ejecutivo de\s+(.+)$",
+            r"(?:argumentos de venta|propuesta comercial breve|bullets de valor|beneficios(?: de nuestros servicios| de nuestros productos)?|speech de 30 segundos|mini agenda de reunion|preguntas de descubrimiento)\s+(?:para|de|con)\s+(.+)$",
+            r"(?:que haria|que harías|que harias)\s+hoy,\s*manana?\s+y\s+esta\s+semana\s+con\s+(.+)$",
             r"(?:dame|quiero|necesito)\s+(?:los\s+)?nombres(?:\s*,\s*|\s+y\s+)?(?:correos?|emails?)(?:\s*,\s*|\s+y\s+)?(?:numeros?|telefonos?)\s+de\s+(.+)$",
             r"(?:dame|quiero|necesito)\s+(?:los\s+)?(?:nombres?|correos?|emails?|numeros?|telefonos?)\s+de\s+(.+)$",
         ]
@@ -443,6 +464,10 @@ class SalesAssistantService:
             "ultima nota agregada",
             "dame clientes calientes y clientes frios",
             "dime todo lo que debo saber de mis contactos o leads",
+            "que oportunidades tengo mas calientes",
+            "donde estoy dejando dinero en la mesa",
+            "analiza mis notas y arma un plan para hoy",
+            "en base a mis notas, que me recomiendas hacer hoy",
         }
         if normalized and normalized not in generic_questions and len(normalized.split()) <= 5:
             return self._clean_search_term(normalized)
@@ -837,6 +862,129 @@ class SalesAssistantService:
             "contacts": contacts[:4],
             "insights": insights,
             "question": question,
+        }
+
+    def _entity_action_plan(self, brief: dict[str, Any]) -> dict[str, Any]:
+        if not brief:
+            return {}
+        latest = brief.get("latest_row") or {}
+        entity_label = (
+            latest.get("company_name")
+            or latest.get("contact_name")
+            or latest.get("full_name")
+            or brief.get("entity_term")
+            or "la cuenta solicitada"
+        )
+        contacts = brief.get("contacts") or []
+        insights = brief.get("insights") or {}
+        notes = brief.get("recent_notes") or []
+        pending = brief.get("pending_tasks") or []
+        recent = brief.get("recent_interactions") or []
+
+        contact_line = None
+        if contacts:
+            top = contacts[0]
+            contact_line = f"{top.get('label') or 'Contacto principal'}"
+            if top.get("email") and top.get("email") != "Sin correo":
+                contact_line += f" ({top['email']})"
+
+        today = insights.get("next_step") or "Retomar la cuenta con un siguiente paso claro."
+        tomorrow = "Enviar seguimiento con propuesta de valor y confirmar decision maker."
+        if pending:
+            tomorrow = f"Empujar el compromiso abierto: {pending[0].get('subject') or 'seguimiento comercial'}."
+        week = "Buscar cierre de fecha para demo, reunion o propuesta concreta."
+        if notes:
+            week = "Convertir las notas recientes en una secuencia concreta: contacto, demo/propuesta y cierre de siguiente compromiso."
+
+        return {
+            "scope": entity_label,
+            "headline": f"Plan comercial para {entity_label}",
+            "summary": insights.get("status"),
+            "contact_line": contact_line,
+            "today": today,
+            "tomorrow": tomorrow,
+            "week": week,
+            "signals": insights.get("signals") or [],
+            "objections": insights.get("objections") or [],
+            "recent_count": len(recent),
+        }
+
+    def _owner_action_plan(self, brief: dict[str, Any], owner_scope: str | None) -> dict[str, Any]:
+        if not brief:
+            return {}
+        owner_name = brief.get("owner_name") or owner_scope or "el vendedor"
+        priorities = brief.get("priorities") or []
+        stale = brief.get("stale_contacts") or []
+        pending = brief.get("pending_tasks") or []
+        recent = brief.get("recent_activity") or []
+
+        today_actions: list[str] = []
+        for row in priorities[:3]:
+            reasons = " / ".join(row.get("reasons") or [])
+            today_actions.append(
+                f"{row.get('related_name') or 'Sin nombre'}: {reasons or 'dar seguimiento prioritario hoy'}"
+            )
+        if not today_actions and recent:
+            for row in recent[:3]:
+                today_actions.append(
+                    f"{row.get('related_name') or 'Sin nombre'}: retomar la conversacion reciente y cerrar siguiente paso."
+                )
+        if not today_actions:
+            today_actions.append("Revisar cartera activa y recuperar oportunidades con señales comerciales recientes.")
+
+        risks = []
+        for row in stale[:3]:
+            risks.append(f"{row.get('related_name') or 'Sin nombre'} lleva tiempo sin contacto.")
+        if pending:
+            risks.append(f"Tienes {len(pending)} compromiso(s) pendiente(s) por empujar.")
+
+        return {
+            "scope": owner_name,
+            "headline": f"Plan comercial de hoy para {owner_name}",
+            "summary": f"Hay {len(priorities)} seguimientos priorizados, {len(pending)} compromisos pendientes y {len(recent)} movimientos recientes visibles.",
+            "today_actions": today_actions,
+            "tomorrow": "Dar seguimiento a quienes respondan hoy y convertir interes en demo, reunion o propuesta.",
+            "week": "Concentrar la semana en las cuentas mas calientes y rescatar 1 o 2 clientes frios recuperables.",
+            "risks": risks,
+        }
+
+    def _sales_material(self, question: str, brief: dict[str, Any]) -> dict[str, Any]:
+        if not brief:
+            return {}
+        latest = brief.get("latest_row") or {}
+        entity_label = (
+            latest.get("company_name")
+            or latest.get("contact_name")
+            or latest.get("full_name")
+            or brief.get("entity_term")
+            or "la cuenta solicitada"
+        )
+        insights = brief.get("insights") or {}
+        contacts = brief.get("contacts") or []
+        notes_text = " || ".join((row.get("content_text") or "") for row in (brief.get("recent_notes") or [])).lower()
+
+        bullets = [
+            "visibilidad operativa de la flota y seguimiento puntual",
+            "mejor control de seguimiento comercial y compromisos",
+            "acompanamiento para aterrizar una demo o siguiente paso claro",
+        ]
+        if "gps" in notes_text or "rastreo" in notes_text:
+            bullets.insert(0, "mejoras sobre su esquema actual de rastreo y monitoreo")
+        if "whatsapp" in notes_text:
+            bullets.append("seguimiento agil por WhatsApp para acelerar coordinacion")
+
+        objections = insights.get("objections") or []
+        responses = []
+        for objection in objections[:3]:
+            responses.append(f"- Objecion: {objection}\n  Respuesta sugerida: bajar la friccion con demo corta, caso de uso concreto y siguiente compromiso con fecha.")
+
+        return {
+            "entity_name": entity_label,
+            "question": question,
+            "bullets": bullets[:5],
+            "contact_name": contacts[0].get("label") if contacts else None,
+            "next_step": insights.get("next_step"),
+            "responses": responses,
         }
 
     def _entity_kpis(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> dict[str, Any]:
@@ -1416,6 +1564,8 @@ class SalesAssistantService:
                 " mis prospectos",
                 " mis notas",
                 " mi cartera",
+                " dinero en la mesa ",
+                " oportunidades ",
             ]
             if any(signal in padded for signal in self_scope_signals):
                 return user.crm_owner_name
@@ -1440,6 +1590,9 @@ class SalesAssistantService:
             "mi cartera",
             "clientes calientes",
             "clientes frios",
+            "analiza mis notas",
+            "que oportunidades tengo",
+            "dinero en la mesa",
         ]
         if any(self._normalize_search_text(signal) in normalized for signal in seller_default_signals):
             return user.crm_owner_name
@@ -1493,6 +1646,11 @@ class SalesAssistantService:
             "prospecto ",
             "contacto ",
             "empresa ",
+            "seguimiento para ",
+            "seguimiento a ",
+            "venta para una llamada con ",
+            "una llamada con ",
+            "llamada con ",
         ]
         removable_suffixes = [
             ", dame solamente eso",
@@ -1761,6 +1919,115 @@ class SalesAssistantService:
                 lines.append(
                     f"- {row.get('label') or 'Sin nombre'} | {row.get('email') or 'Sin correo'} | {row.get('phone') or 'Sin telefono'}"
                 )
+        return "\n".join(lines)
+
+    def _format_action_plan(self, plan: dict[str, Any]) -> str:
+        if not plan:
+            return "No encontre suficiente contexto para proponer un plan accionable."
+        lines = [plan.get("headline") or "Plan de accion"]
+        if plan.get("summary"):
+            lines.append(plan["summary"])
+        if plan.get("contact_line"):
+            lines.append(f"Contacto recomendado: {plan['contact_line']}")
+
+        today_actions = plan.get("today_actions")
+        if today_actions:
+            lines.append("")
+            lines.append("Prioridades de hoy:")
+            for item in today_actions[:4]:
+                lines.append(f"- {item}")
+        elif plan.get("today"):
+            lines.append("")
+            lines.append(f"Hoy: {plan['today']}")
+
+        if plan.get("tomorrow"):
+            lines.append(f"Mañana: {plan['tomorrow']}")
+        if plan.get("week"):
+            lines.append(f"Esta semana: {plan['week']}")
+
+        risks = plan.get("risks") or []
+        objections = plan.get("objections") or []
+        if risks or objections:
+            lines.append("")
+            lines.append("Riesgos a cuidar:")
+            for risk in (risks + objections)[:4]:
+                lines.append(f"- {risk}")
+        return "\n".join(lines)
+
+    def _format_sales_material(self, material: dict[str, Any]) -> str:
+        if not material:
+            return "No encontre suficiente contexto para preparar ese material comercial."
+        question = self._normalize_search_text(material.get("question") or "")
+        entity_name = material.get("entity_name") or "la cuenta solicitada"
+        bullets = material.get("bullets") or []
+        next_step = material.get("next_step")
+
+        if "whatsapp" in question:
+            opening = material.get("contact_name") or "equipo"
+            lines = [
+                f"WhatsApp sugerido para {entity_name}:",
+                f"Hola {opening}, te escribo para retomar la conversacion con {entity_name}.",
+                f"Creo que Flotimatics puede ayudarte especialmente con {bullets[0] if bullets else 'visibilidad operativa y seguimiento comercial'}.",
+                "Si te hace sentido, armamos una llamada o demo corta esta semana.",
+            ]
+            return "\n".join(lines)
+
+        if "speech" in question:
+            return (
+                f"Speech de 30 segundos para {entity_name}:\n"
+                f"\"En Flotimatics les podemos ayudar con {', '.join(bullets[:2])}. "
+                f"La idea no es solo mostrar tecnologia, sino aterrizar una solucion que les deje mas control operativo y un siguiente paso claro. "
+                f"{next_step or 'Si hace sentido, propondria una demo corta para aterrizarlo.'}\""
+            )
+
+        if "agenda" in question:
+            lines = [f"Mini agenda de reunion para {entity_name}:"]
+            lines.extend(
+                [
+                    "- Repaso rapido del contexto actual del cliente",
+                    "- Deteccion de necesidad operativa y dolor principal",
+                    "- Presentacion de valor Flotimatics",
+                    f"- {next_step or 'Definicion de siguiente paso con fecha'}",
+                ]
+            )
+            return "\n".join(lines)
+
+        if "preguntas de descubrimiento" in question:
+            return "\n".join(
+                [
+                    f"Preguntas de descubrimiento para {entity_name}:",
+                    "- ¿Como estan resolviendo hoy el seguimiento operativo y comercial?",
+                    "- ¿Que les esta costando mas trabajo en la operacion actual?",
+                    "- ¿Quien participa en la decision y que necesita ver para avanzar?",
+                    "- ¿Que resultado tendria que lograr una demo o propuesta para que valga la pena?",
+                ]
+            )
+
+        if "objeciones probables" in question or "como responderlas" in question:
+            responses = material.get("responses") or []
+            if responses:
+                return "\n".join([f"Objeciones probables para {entity_name}:"] + responses)
+            return "\n".join(
+                [
+                    f"Objeciones probables para {entity_name}:",
+                    "- Objecion: ya tienen una solucion actual\n  Respuesta sugerida: comparar contra dolores actuales y proponer demo enfocada a mejora concreta.",
+                    "- Objecion: no ven urgencia\n  Respuesta sugerida: aterrizar costo de seguir igual y siguiente paso pequeno, no invasivo.",
+                ]
+            )
+
+        lines = [f"Material comercial para {entity_name}:"]
+        if "argumentos de venta" in question:
+            lines[0] = f"Argumentos de venta para {entity_name}:"
+        elif "propuesta comercial" in question:
+            lines[0] = f"Propuesta comercial breve para {entity_name}:"
+        elif "beneficios" in question:
+            lines[0] = f"Beneficios recomendados para {entity_name}:"
+        elif "bullets de valor" in question:
+            lines[0] = f"Bullets de valor para {entity_name}:"
+        for bullet in bullets[:5]:
+            lines.append(f"- {bullet}")
+        if next_step:
+            lines.append(f"Siguiente paso sugerido: {next_step}")
         return "\n".join(lines)
 
     def _format_owner_brief(self, brief: dict[str, Any], owner_scope: str | None) -> str:
@@ -2137,6 +2404,10 @@ class SalesAssistantService:
         direct_answer = evidence.get("direct_answer")
         if direct_answer:
             sections.append(direct_answer)
+        elif evidence.get("action_plan"):
+            sections.append(self._format_action_plan(evidence["action_plan"]))
+        elif evidence.get("sales_material"):
+            sections.append(self._format_sales_material(evidence["sales_material"]))
         elif evidence.get("sales_draft"):
             sections.append(self._format_sales_draft(evidence["sales_draft"]))
         elif evidence.get("entity_brief"):
@@ -2171,6 +2442,7 @@ class SalesAssistantService:
             "No inventes contactos, teléfonos, correos, responsables, unidades ni conclusiones.",
             "Si la evidencia es parcial, entrega lo que sí está respaldado y di claramente lo que falta.",
             "Cuando la pregunta sea amplia, sintetiza primero el panorama y luego baja a datos concretos.",
+            "Si te piden propuesta, comentario comercial, formato, redaccion o plan, responde como asesor comercial y no solo como buscador de datos.",
         ]
         if intent.mode == "data":
             instructions.append("Como la consulta es de datos, responde de forma breve y directa.")
@@ -2186,6 +2458,8 @@ class SalesAssistantService:
             f"Resumen cliente: {evidence.get('entity_brief')}",
             f"Resumen vendedor: {evidence.get('owner_brief')}",
             f"Resumen equipo: {evidence.get('team_brief')}",
+            f"Plan sugerido: {evidence.get('action_plan')}",
+            f"Material comercial sugerido: {evidence.get('sales_material')}",
             f"Borrador comercial sugerido: {evidence.get('sales_draft')}",
             "Coincidencias CRM:\n" + serialize_rows(evidence.get("matches", [])),
             "Contactos detectados:\n" + serialize_rows(evidence.get("contact_rows", [])),

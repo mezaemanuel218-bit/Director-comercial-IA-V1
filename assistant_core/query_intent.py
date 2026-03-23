@@ -24,6 +24,9 @@ class QuestionIntent:
     asks_for_owner_brief: bool
     asks_for_team_brief: bool
     asks_for_sales_draft: bool
+    asks_for_action_plan: bool
+    asks_for_sales_material: bool
+    asks_for_formatted_output: bool
     asks_for_owner_load: bool
     asks_for_assigned_clients: bool
     asks_for_interactions_by_owner: bool
@@ -54,7 +57,85 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_contact_directory = any(token in q for token in ["contacto", "contactos"]) and any(token in q for token in [" de ", " del ", ":"])
     asks_for_sales_draft = (
         any(token in q for token in ["correo", "mail", "email", "mensaje", "whatsapp", "propuesta"])
-        and any(token in q for token in ["mandarle", "mandar", "redacta", "redactame", "escribe", "borrador", "draft", "usa todo lo que sabes"])
+        and any(
+            token in q
+            for token in [
+                "mandarle",
+                "mandar",
+                "redacta",
+                "redactame",
+                "escribe",
+                "borrador",
+                "draft",
+                "usa todo lo que sabes",
+                "fabrica",
+                "hazme",
+                "asunto y cuerpo",
+            ]
+        )
+    )
+    asks_for_action_plan = any(
+        token in q
+        for token in [
+            "plan para hoy",
+            "plan de trabajo",
+            "plan de seguimiento",
+            "plan de accion",
+            "que haria hoy",
+            "que harias hoy",
+            "hoy, manana y esta semana",
+            "hoy mañana y esta semana",
+            "siguiente paso comercial",
+            "siguiente paso",
+            "que me recomiendas hacer hoy",
+            "a quien debo contactar hoy",
+            "a quien debo llamar hoy",
+            "si solo pudiera hacer una accion hoy",
+            "si solo pudiera hacer una acción hoy",
+            "que oportunidades tengo mas calientes",
+            "donde estoy dejando dinero en la mesa",
+            "que clientes mios estan mas vivos",
+            "que clientes mios ya se enfriaron",
+            "si quisiera vender este mes",
+            "que cliente de mi cartera esta mas cerca de avanzar",
+            "que cliente de mi cartera ves mas frio pero recuperable",
+            "si fueras yo",
+            "si fueras director comercial",
+        ]
+    )
+    asks_for_sales_material = any(
+        token in q
+        for token in [
+            "argumentos de venta",
+            "speech de 30 segundos",
+            "speech de 30 segundos",
+            "bullets de valor",
+            "beneficios de nuestros servicios",
+            "beneficios de nuestros productos",
+            "propuesta comercial breve",
+            "mini agenda de reunion",
+            "mini agenda de reunión",
+            "preguntas de descubrimiento",
+            "objeciones probables y como responderlas",
+            "objeciones probables y cómo responderlas",
+            "como responderlas",
+            "como responderlas",
+        ]
+    )
+    asks_for_formatted_output = any(
+        token in q
+        for token in [
+            "como correo",
+            "como whatsapp",
+            "como plan de accion",
+            "como plan de acción",
+            "formato ejecutivo",
+            "en bullets",
+            "solo recomendacion y riesgos",
+            "solo recomendación y riesgos",
+            "conclusion y luego evidencia",
+            "conclusión y luego evidencia",
+        ]
     )
     asks_for_client_brief = (
         any(token in q for token in [
@@ -96,6 +177,8 @@ def classify_question(question: str) -> QuestionIntent:
             "mis pendientes",
             "clientes calientes",
             "clientes frios",
+            "mis notas",
+            "mis oportunidades",
         ]
     )
     asks_for_team_brief = any(
@@ -156,8 +239,26 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "compromiso", "tarea"])
     asks_for_latest_note = any(token in q for token in ["ultima nota", "última nota", "nota agregada", "nota mas reciente", "nota más reciente"])
 
-    analysis_signals = ["plan", "estrategia", "por que", "recomienda", "conviene", "analiza", "compar", "riesgo", "diferencias entre", "en base a mis notas"]
-    data_signals = ["solo", "dame", "lista", "correos", "telefonos", "nombres", "ultimo", "kpi", "kpis"]
+    analysis_signals = [
+        "plan",
+        "estrategia",
+        "por que",
+        "recomienda",
+        "conviene",
+        "analiza",
+        "compar",
+        "riesgo",
+        "diferencias entre",
+        "en base a mis notas",
+        "que haria",
+        "que harias",
+        "donde estoy dejando dinero",
+        "oportunidades calientes",
+        "siguiente paso",
+        "argumentos de venta",
+        "propuesta comercial",
+    ]
+    data_signals = ["solo", "dame", "lista", "correos", "telefonos", "nombres", "ultimo", "kpi", "kpis", "asunto y cuerpo"]
 
     has_analysis = any(signal in q for signal in analysis_signals)
     has_data = any(signal in q for signal in data_signals)
@@ -180,6 +281,9 @@ def classify_question(question: str) -> QuestionIntent:
         asks_for_owner_brief=asks_for_owner_brief,
         asks_for_team_brief=asks_for_team_brief,
         asks_for_sales_draft=asks_for_sales_draft,
+        asks_for_action_plan=asks_for_action_plan,
+        asks_for_sales_material=asks_for_sales_material,
+        asks_for_formatted_output=asks_for_formatted_output,
         asks_for_owner_load=asks_for_owner_load,
         asks_for_assigned_clients=asks_for_assigned_clients,
         asks_for_interactions_by_owner=asks_for_interactions_by_owner,
