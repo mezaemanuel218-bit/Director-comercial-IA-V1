@@ -27,6 +27,7 @@ class QuestionIntent:
     asks_for_action_plan: bool
     asks_for_sales_material: bool
     asks_for_formatted_output: bool
+    asks_for_multi_step: bool
     asks_for_owner_load: bool
     asks_for_assigned_clients: bool
     asks_for_interactions_by_owner: bool
@@ -70,9 +71,15 @@ def classify_question(question: str) -> QuestionIntent:
                 "usa todo lo que sabes",
                 "fabrica",
                 "hazme",
+                "armame",
                 "asunto y cuerpo",
+                "correo para",
+                "mensaje para",
             ]
         )
+    ) or (
+        "seguimiento para " in q
+        and any(token in q for token in ["redacta", "fabrica", "escribe", "mensaje", "correo", "seguimiento"])
     )
     asks_for_action_plan = any(
         token in q
@@ -135,6 +142,19 @@ def classify_question(question: str) -> QuestionIntent:
             "solo recomendación y riesgos",
             "conclusion y luego evidencia",
             "conclusión y luego evidencia",
+        ]
+    )
+    asks_for_multi_step = any(
+        token in q
+        for token in [
+            " y luego ",
+            " luego ",
+            "despues ",
+            "después ",
+            "detecta riesgo y redacta",
+            "resume la cuenta, detecta riesgo y redacta",
+            "dame resumen de ",
+            "y proponme siguiente paso",
         ]
     )
     asks_for_client_brief = (
@@ -284,6 +304,7 @@ def classify_question(question: str) -> QuestionIntent:
         asks_for_action_plan=asks_for_action_plan,
         asks_for_sales_material=asks_for_sales_material,
         asks_for_formatted_output=asks_for_formatted_output,
+        asks_for_multi_step=asks_for_multi_step,
         asks_for_owner_load=asks_for_owner_load,
         asks_for_assigned_clients=asks_for_assigned_clients,
         asks_for_interactions_by_owner=asks_for_interactions_by_owner,

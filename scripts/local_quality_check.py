@@ -84,6 +84,12 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
         {"username": "emeza", "question": "compromisos pendientes para hoy"},
         {"username": "emeza", "question": "a quien le hable ayer"},
         {"username": "emeza", "question": "mis kpis"},
+        {"username": "emeza", "question": "analiza mis notas y arma un plan para hoy"},
+        {"username": "emeza", "question": "en base a mis notas, que me recomiendas hacer hoy"},
+        {"username": "emeza", "question": "que oportunidades tengo mas calientes"},
+        {"username": "emeza", "question": "donde estoy dejando dinero en la mesa"},
+        {"username": "emeza", "question": "dame mis oportunidades mas fuertes y escribe un correo para la principal"},
+        {"username": "emeza", "question": "dame mis clientes calientes y luego armame mensaje para el mejor"},
     ]
     questions.extend(base_self_questions)
 
@@ -107,6 +113,10 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
                 {"username": "emeza", "question": f"que objeciones hay en {entity}"},
                 {"username": "emeza", "question": f"que sigue con {entity}"},
                 {"username": "emeza", "question": f"ultimo contacto de {entity}"},
+                {"username": "emeza", "question": f"redactame un correo para {entity} buscando cerrar una demo"},
+                {"username": "emeza", "question": f"hazme argumentos de venta para una llamada con {entity}"},
+                {"username": "emeza", "question": f"que harias hoy, manana y esta semana con {entity}"},
+                {"username": "emeza", "question": f"dame resumen de {entity} y luego redactame un correo"},
             ]
         )
 

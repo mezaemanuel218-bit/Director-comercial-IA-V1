@@ -11,7 +11,9 @@ import assistant_core.history as history_module
 class SalesAssistantServiceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.service = SalesAssistantService()
+        desktop_db = Path(r"C:\Users\sopor\OneDrive\Datos adjuntos\Desktop\Director Comercial IA\data\warehouse.db")
+        db_path = str(desktop_db) if desktop_db.exists() else None
+        cls.service = SalesAssistantService(db_path=db_path)
         cls.emeza = get_user("emeza")
 
     def test_movimex_contact_query_detects_note_and_crm_emails(self) -> None:
@@ -118,6 +120,21 @@ class SalesAssistantServiceTests(unittest.TestCase):
         answer = response.answer.lower()
         self.assertIn("clientes calientes", answer)
         self.assertIn("clientes frios", answer)
+
+    def test_action_plan_query_should_be_detected(self) -> None:
+        intent = classify_question("analiza mis notas y arma un plan para hoy")
+        self.assertTrue(intent.asks_for_action_plan)
+
+    def test_sales_material_query_should_be_detected(self) -> None:
+        intent = classify_question("hazme argumentos de venta para una llamada con cafenio")
+        self.assertTrue(intent.asks_for_sales_material)
+
+    def test_compound_question_keeps_entity_context(self) -> None:
+        parts = self.service._contextualize_subquestions(
+            "dame resumen de movimex y luego redactame un correo",
+            ["dame resumen de movimex", "redactame un correo"],
+        )
+        self.assertEqual(parts[1], "redactame un correo para movimex")
 
 
 class HistoryIsolationTests(unittest.TestCase):
