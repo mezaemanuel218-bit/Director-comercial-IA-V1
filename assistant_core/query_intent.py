@@ -106,6 +106,7 @@ def classify_question(question: str) -> QuestionIntent:
             "si quisiera vender este mes",
             "que cliente de mi cartera esta mas cerca de avanzar",
             "que cliente de mi cartera ves mas frio pero recuperable",
+            "que tres clientes debo atacar primero esta semana",
             "si fueras yo",
             "si fueras director comercial",
         ]
@@ -164,6 +165,7 @@ def classify_question(question: str) -> QuestionIntent:
             "resumen del cliente",
             "resumen del prospecto",
             "resumen comercial",
+            "resumeme ",
             "estatus del cliente",
             "historial del cliente",
             "dame contexto de",
@@ -174,6 +176,10 @@ def classify_question(question: str) -> QuestionIntent:
             "objeciones de",
             "objeciones en",
             "resumen ejecutivo de",
+            "si entro a una llamada en 5 minutos con",
+            "si entro a una llamada con",
+            "antes de una reunion con",
+            "brief de cliente para antes de una reunion con",
         ])
         or (
             any(token in q for token in ["cliente", "prospecto", "lead", "cuenta", "empresa"])
@@ -215,8 +221,15 @@ def classify_question(question: str) -> QuestionIntent:
     )
 
     asks_for_owner_load = (
-        (any(token in q for token in ["cuantos clientes", "asignados", "carga"]) and any(token in q for token in ["vendedor", "propietario", "agente", "clientes"]))
-        or any(token in q for token in ["quien tiene mas clientes asignados", "carga por vendedor", "quien tiene mas prospectos asignados"])
+        any(token in q for token in ["quien tiene mas clientes asignados", "carga por vendedor", "quien tiene mas prospectos asignados"])
+        or (
+            any(token in q for token in ["carga", "asignados"])
+            and any(token in q for token in ["vendedor", "propietario", "agente", "owner", "owners", "por vendedor"])
+        )
+        or (
+            "cuantos clientes" in q
+            and any(token in q for token in ["por vendedor", "cada vendedor", "vendedor", "propietario", "agente"])
+        )
     )
 
     asks_for_assigned_clients = any(

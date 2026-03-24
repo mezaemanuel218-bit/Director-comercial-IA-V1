@@ -4,6 +4,7 @@ import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from typing import Any
 
 from dotenv import load_dotenv
@@ -45,6 +46,7 @@ class ContactRow:
 class EntityResolution:
     canonical_name: str | None
     aliases: list[str]
+    confidence: float = 0.0
 
 
 class SalesAssistantService:
@@ -237,6 +239,15 @@ class SalesAssistantService:
         normalized = self._normalize_search_text(question)
         if "analiza mis notas y arma un plan para hoy" in normalized:
             return [question]
+        if "conclusion y luego evidencia" in normalized or "conclusion primero y luego evidencia" in normalized:
+            return [question]
+        question_parts = [
+            part.strip(" ,.;:-")
+            for part in re.split(r"\?\s+(?=(?:que|cuantos|cuantas|como|dame|hazme|analiza|resume|redacta|escribe)\b)", question.strip(), flags=re.IGNORECASE)
+            if part and part.strip(" ,.;:-")
+        ]
+        if len(question_parts) > 1:
+            return question_parts
         if not any(token in normalized for token in [" y luego ", " despues ", " después ", " y redacta ", " y proponme ", " detecta riesgo y redacta ", " y escribe ", " y arma ", " y hazme ", " y fabrica "]):
             return [question]
         pattern = re.compile(
@@ -255,7 +266,20 @@ class SalesAssistantService:
     ) -> str:
         if not subresponses:
             return "No encontre evidencia suficiente para responder."
-        lines = [f"Respuesta compuesta para: {question}", ""]
+        if len(subresponses) <= 2:
+            merged: list[str] = []
+            seen: set[str] = set()
+            for response in subresponses:
+                answer = response.answer.strip()
+                if not answer:
+                    continue
+                key = self._normalize_search_text(answer)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(answer)
+            return "\n\n".join(merged).strip() or "No encontre evidencia suficiente para responder."
+        lines = [f"Respuesta integrada para: {question}", ""]
         for index, (subquestion, subresponse) in enumerate(zip(subquestions, subresponses), start=1):
             lines.append(f"{index}. {subquestion}")
             lines.append(subresponse.answer.strip())
@@ -290,6 +314,13 @@ class SalesAssistantService:
                 if rewritten.lower().startswith("mensaje para") or rewritten.lower().startswith("un mensaje para"):
                     rewritten = f"armame {rewritten}"
                 contextualized.append(f"{rewritten} para {carried}" if f"para {carried}".lower() not in rewritten.lower() else rewritten)
+            elif any(token in normalized for token in ["ese nombre", "esa cuenta", "ese cliente", "ese prospecto", "para el", "para ella"]):
+                rewritten = subquestion.strip()
+                for marker in ["ese nombre", "esa cuenta", "ese cliente", "ese prospecto", "para el", "para ella"]:
+                    rewritten = re.sub(marker, carried, rewritten, flags=re.IGNORECASE)
+                if carried.lower() not in rewritten.lower():
+                    rewritten = f"{rewritten} con {carried}"
+                contextualized.append(rewritten)
             elif "responderlas" in normalized:
                 contextualized.append(f"objeciones probables y como responderlas de {carried}")
             elif any(token in normalized for token in ["riesgo", "riesgos", "objecion", "objeciones", "resume", "resumen", "cuenta"]):
@@ -356,9 +387,12 @@ class SalesAssistantService:
             "comparison_candidates",
             "owner_comparison",
             "owner_load",
+            "ranked_accounts",
             "owner_kpis",
             "global_kpis",
             "assigned_clients",
+            "entity_count_summary",
+            "owner_client_count",
             "pending_tasks",
             "today_pending",
             "stale_contacts",
@@ -381,6 +415,7 @@ class SalesAssistantService:
 
     def _collect_evidence(self, question: str, intent: QuestionIntent, owner_scope: str | None = None) -> dict[str, Any]:
         entity_term = self._extract_entity_hint(question)
+        normalized_question = self._normalize_search_text(question)
         evidence: dict[str, Any] = {
             "sources": ["warehouse.db"],
             "entity_hint": entity_term,
@@ -388,19 +423,48 @@ class SalesAssistantService:
         }
 
         with self._connect() as conn:
+            if owner_scope:
+                evidence["owner_scope"] = owner_scope
             if entity_term:
-                evidence["matches"] = self._entity_matches(conn, entity_term, owner_scope=owner_scope)
-                evidence["recent_interactions"] = self._recent_interactions_for_entity(conn, entity_term, owner_scope=owner_scope)
-                evidence["recent_notes"] = self._recent_notes_for_entity(conn, entity_term, owner_scope=owner_scope)
-                evidence["contact_rows"] = [row.__dict__ for row in self._contact_rows_for_entity(conn, entity_term, owner_scope=owner_scope)]
+                resolution = self._resolve_entity(conn, entity_term, owner_scope=owner_scope)
+                evidence["entity_resolution"] = {
+                    "canonical_name": resolution.canonical_name,
+                    "aliases": resolution.aliases,
+                    "confidence": resolution.confidence,
+                }
+                evidence["matches"] = self._entity_matches(conn, entity_term, owner_scope=owner_scope, resolution=resolution)
+                evidence["recent_interactions"] = self._recent_interactions_for_entity(conn, entity_term, owner_scope=owner_scope, resolution=resolution)
+                evidence["recent_notes"] = self._recent_notes_for_entity(conn, entity_term, owner_scope=owner_scope, resolution=resolution)
+                evidence["contact_rows"] = [row.__dict__ for row in self._contact_rows_for_entity(conn, entity_term, owner_scope=owner_scope, resolution=resolution)]
+                if not (
+                    evidence.get("matches")
+                    or evidence.get("recent_interactions")
+                    or evidence.get("recent_notes")
+                    or evidence.get("contact_rows")
+                ):
+                    evidence["entity_suggestions"] = self._entity_suggestions(conn, entity_term, owner_scope=owner_scope)
             entity_has_evidence = bool(
                 evidence.get("matches")
                 or evidence.get("recent_interactions")
                 or evidence.get("recent_notes")
                 or evidence.get("contact_rows")
             )
+            asks_for_count = any(token in normalized_question for token in ["cuantos", "cuantas", "cuanto", "cantidad", "numero de", "número de"])
+            asks_for_rank = any(token in normalized_question for token in ["mejor", "mejores", "top", "principal", "principales"]) and any(
+                token in normalized_question for token in ["cliente", "clientes", "prospecto", "prospectos", "cuenta", "cuentas", "lead", "leads"]
+            )
 
-            if intent.asks_for_action_plan:
+            if asks_for_rank and owner_scope:
+                limit = self._extract_rank_limit(normalized_question)
+                evidence["ranked_accounts"] = self._owner_ranked_accounts(conn, owner_scope, limit=limit)
+                evidence["direct_answer"] = self._format_owner_ranked_accounts(evidence["ranked_accounts"], owner_scope, limit)
+            elif asks_for_count and entity_term and entity_has_evidence:
+                evidence["entity_count_summary"] = self._entity_count_summary(conn, entity_term, owner_scope=owner_scope)
+                evidence["direct_answer"] = self._format_entity_count_summary(evidence["entity_count_summary"])
+            elif asks_for_count and owner_scope and any(token in normalized_question for token in ["cliente", "clientes", "prospecto", "prospectos", "lead", "leads", "cuenta", "cuentas"]):
+                evidence["owner_client_count"] = self._owner_client_count_summary(conn, owner_scope)
+                evidence["direct_answer"] = self._format_owner_client_count_summary(evidence["owner_client_count"], owner_scope)
+            elif intent.asks_for_action_plan:
                 if entity_term and entity_has_evidence:
                     evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
                     evidence["action_plan"] = self._entity_action_plan(evidence["entity_brief"])
@@ -538,6 +602,8 @@ class SalesAssistantService:
             elif entity_term and entity_has_evidence:
                 evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
                 evidence["direct_answer"] = self._format_entity_brief(evidence["entity_brief"])
+            elif entity_term and evidence.get("entity_suggestions"):
+                evidence["direct_answer"] = self._format_entity_suggestions(entity_term, evidence["entity_suggestions"])
 
             evidence["document_chunks"] = self._document_search(conn, question, entity_term)
             if evidence["document_chunks"]:
@@ -558,11 +624,11 @@ class SalesAssistantService:
             match = re.search(pattern, normalized, flags=re.IGNORECASE)
             if match:
                 candidate = self._clean_search_term(match.group(1).strip(" ?.:"))
-                if candidate:
+                if candidate and not self._is_noise_entity_hint(candidate):
                     return candidate
         if " de " in normalized and any(token in normalized for token in ["correo", "telefono", "numero", "nombre", "contacto"]):
             trailing = self._clean_search_term(normalized.rsplit(" de ", 1)[-1].strip(" ?.:"))
-            if trailing and trailing not in {"la semana", "semana"}:
+            if trailing and trailing not in {"la semana", "semana"} and not self._is_noise_entity_hint(trailing):
                 return trailing
         specific_patterns = [
             r"kpi(?:s)?\s+(.+?)\s+de\s+la\s+semana$",
@@ -571,17 +637,21 @@ class SalesAssistantService:
             r"que objeciones?\s+tiene\s+(.+)$",
             r"hazme un resumen ejecutivo de\s+(.+)$",
             r"resumen(?: comercial)? de\s+(.+)$",
+            r"resumeme\s+(.+?)\s+en\s+contexto,\s*riesgo\s+y\s+siguiente\s+paso$",
             r"resume la cuenta(?: de)?\s+(.+)$",
+            r"si entro a una llamada(?: en 5 minutos)? con\s+(.+)$",
+            r"antes de una reunion con\s+(.+)$",
             r"(?:argumentos de venta|propuesta comercial breve|bullets de valor|beneficios(?: de nuestros servicios| de nuestros productos)?|speech de 30 segundos|mini agenda de reunion|preguntas de descubrimiento)\s+(?:para|de|con)\s+(.+)$",
             r"(?:que haria|que harías|que harias)\s+hoy,\s*manana?\s+y\s+esta\s+semana\s+con\s+(.+)$",
             r"(?:dame|quiero|necesito)\s+(?:los\s+)?nombres(?:\s*,\s*|\s+y\s+)?(?:correos?|emails?)(?:\s*,\s*|\s+y\s+)?(?:numeros?|telefonos?)\s+de\s+(.+)$",
             r"(?:dame|quiero|necesito)\s+(?:los\s+)?(?:nombres?|correos?|emails?|numeros?|telefonos?)\s+de\s+(.+)$",
         ]
+        specific_patterns.append(r"(?:registrados?|registradas?|dados de alta)\s+(?:con|a nombre de)\s+(.+)$")
         for pattern in specific_patterns:
             match = re.search(pattern, normalized, flags=re.IGNORECASE)
             if match:
                 candidate = self._clean_search_term(match.group(1).strip(" ?.:"))
-                if candidate:
+                if candidate and not self._is_noise_entity_hint(candidate):
                     return candidate
         patterns = [
             r"(?:correos?|emails?|telefonos?|numeros?|nombres?|contactos?)\s+(?:de|del)\s+(.+)$",
@@ -593,15 +663,15 @@ class SalesAssistantService:
             match = re.search(pattern, normalized, flags=re.IGNORECASE)
             if match:
                 candidate = self._clean_search_term(match.group(1).strip(" ?.:"))
-                if candidate:
+                if candidate and not self._is_noise_entity_hint(candidate):
                     return candidate
         if ":" in normalized:
             trailing = self._clean_search_term(normalized.rsplit(":", 1)[-1].strip(" ?.:"))
-            if trailing:
+            if trailing and not self._is_noise_entity_hint(trailing):
                 return trailing
         if " de " in normalized and any(token in normalized for token in ["correo", "telefono", "numero", "nombre", "contacto", "kpi"]):
             trailing = self._clean_search_term(normalized.rsplit(" de ", 1)[-1].strip(" ?.:"))
-            if trailing and trailing not in {"la semana", "semana"}:
+            if trailing and trailing not in {"la semana", "semana"} and not self._is_noise_entity_hint(trailing):
                 return trailing
         generic_questions = {
             "kpi global",
@@ -616,10 +686,30 @@ class SalesAssistantService:
             "donde estoy dejando dinero en la mesa",
             "analiza mis notas y arma un plan para hoy",
             "en base a mis notas, que me recomiendas hacer hoy",
+            "dame primero conclusion y luego evidencia sobre mi cartera",
         }
         if normalized and normalized not in generic_questions and len(normalized.split()) <= 5:
-            return self._clean_search_term(normalized)
+            candidate = self._clean_search_term(normalized)
+            if not self._is_noise_entity_hint(candidate):
+                return candidate
         return None
+
+    def _is_noise_entity_hint(self, candidate: str) -> bool:
+        return candidate in {
+            "alta",
+            "de alta",
+            "baja",
+            "primero conclusion",
+            "hoy",
+            "ayer",
+            "antier",
+            "anteayer",
+            "la semana",
+            "semana",
+            "el mes",
+            "mes",
+            "ese nombre",
+        }
 
     def _resolve_entity(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> EntityResolution:
         cleaned = self._clean_search_term(term)
@@ -650,6 +740,7 @@ class SalesAssistantService:
             if not normalized_name:
                 continue
             score = 0
+            ratio = SequenceMatcher(None, cleaned, normalized_name).ratio()
             if normalized_name == cleaned:
                 score += 120
             if cleaned in normalized_name or normalized_name in cleaned:
@@ -662,23 +753,61 @@ class SalesAssistantService:
                 score += 15
             if normalized_name.startswith(cleaned) or cleaned.startswith(normalized_name):
                 score += 10
+            score += int(ratio * 45)
             if score > 0:
                 scored.append((score, str(raw_name)))
 
         if not scored:
-            return EntityResolution(canonical_name=cleaned, aliases=[cleaned])
+            return EntityResolution(canonical_name=cleaned, aliases=[cleaned], confidence=0.0)
 
         scored.sort(key=lambda item: (-item[0], item[1]))
         top_score = scored[0][0]
-        aliases = [name for score, name in scored if score >= max(25, top_score - 25)]
+        top_name = scored[0][1]
+        top_ratio = SequenceMatcher(None, cleaned, self._clean_search_term(top_name)).ratio()
+        if top_score < 55 and top_ratio < 0.72:
+            return EntityResolution(canonical_name=cleaned, aliases=[cleaned], confidence=top_ratio)
+        aliases = [name for score, name in scored if score >= max(45, top_score - 20)]
         canonical_name = aliases[0] if aliases else cleaned
         cleaned_aliases = list(dict.fromkeys([canonical_name, *aliases, cleaned]))
-        return EntityResolution(canonical_name=canonical_name, aliases=cleaned_aliases[:6])
+        return EntityResolution(canonical_name=canonical_name, aliases=cleaned_aliases[:6], confidence=top_ratio)
 
     def _entity_patterns(self, resolution: EntityResolution) -> list[str]:
         aliases = resolution.aliases or ([resolution.canonical_name] if resolution.canonical_name else [])
         patterns = [f"%{self._clean_search_term(alias)}%" for alias in aliases if alias]
         return patterns or ["%"]
+
+    def _entity_suggestions(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None, limit: int = 3) -> list[str]:
+        cleaned = self._clean_search_term(term)
+        if not cleaned:
+            return []
+        candidate_rows: list[str] = []
+        queries = [
+            "SELECT DISTINCT company_name AS name FROM leads WHERE company_name IS NOT NULL",
+            "SELECT DISTINCT company_name AS name FROM contacts WHERE company_name IS NOT NULL",
+            "SELECT DISTINCT related_name AS name FROM interactions WHERE related_name IS NOT NULL",
+            "SELECT DISTINCT parent_name AS name FROM notes WHERE parent_name IS NOT NULL",
+        ]
+        for query in queries:
+            try:
+                candidate_rows.extend(
+                    row["name"]
+                    for row in conn.execute(query).fetchall()
+                    if row["name"] and str(row["name"]).strip()
+                )
+            except sqlite3.OperationalError:
+                continue
+        term_tokens = self._entity_tokens(cleaned)
+        scored: list[tuple[float, str]] = []
+        for raw_name in dict.fromkeys(candidate_rows):
+            normalized_name = self._clean_search_term(str(raw_name))
+            if not normalized_name:
+                continue
+            ratio = SequenceMatcher(None, cleaned, normalized_name).ratio()
+            overlap = len(term_tokens & self._entity_tokens(normalized_name))
+            if ratio >= 0.42 or overlap >= 1:
+                scored.append((ratio + overlap * 0.15, str(raw_name)))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [name for _, name in scored[:limit]]
 
     def _entity_tokens(self, value: str) -> set[str]:
         stopwords = {
@@ -706,8 +835,14 @@ class SalesAssistantService:
         }
         return tokens
 
-    def _entity_matches(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> list[dict[str, Any]]:
-        resolution = self._resolve_entity(conn, term, owner_scope=owner_scope)
+    def _entity_matches(
+        self,
+        conn: sqlite3.Connection,
+        term: str,
+        owner_scope: str | None = None,
+        resolution: EntityResolution | None = None,
+    ) -> list[dict[str, Any]]:
+        resolution = resolution or self._resolve_entity(conn, term, owner_scope=owner_scope)
         patterns = self._entity_patterns(resolution)
         query = """
         SELECT *
@@ -753,8 +888,14 @@ class SalesAssistantService:
         query += " ORDER BY last_activity_time DESC, company_name, contact_name LIMIT 25"
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 
-    def _recent_interactions_for_entity(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> list[dict[str, Any]]:
-        resolution = self._resolve_entity(conn, term, owner_scope=owner_scope)
+    def _recent_interactions_for_entity(
+        self,
+        conn: sqlite3.Connection,
+        term: str,
+        owner_scope: str | None = None,
+        resolution: EntityResolution | None = None,
+    ) -> list[dict[str, Any]]:
+        resolution = resolution or self._resolve_entity(conn, term, owner_scope=owner_scope)
         patterns = self._entity_patterns(resolution)
         query = """
         SELECT related_name, related_module, owner_name, source_type, interaction_at, status, summary
@@ -771,8 +912,14 @@ class SalesAssistantService:
         query += " ORDER BY interaction_at DESC LIMIT 12"
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 
-    def _recent_notes_for_entity(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> list[dict[str, Any]]:
-        resolution = self._resolve_entity(conn, term, owner_scope=owner_scope)
+    def _recent_notes_for_entity(
+        self,
+        conn: sqlite3.Connection,
+        term: str,
+        owner_scope: str | None = None,
+        resolution: EntityResolution | None = None,
+    ) -> list[dict[str, Any]]:
+        resolution = resolution or self._resolve_entity(conn, term, owner_scope=owner_scope)
         patterns = self._entity_patterns(resolution)
         query = """
         SELECT parent_name, parent_module, owner_name, created_time, title, content_text
@@ -795,11 +942,18 @@ class SalesAssistantService:
         query += " ORDER BY created_time DESC LIMIT 12"
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 
-    def _contact_rows_for_entity(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> list[ContactRow]:
+    def _contact_rows_for_entity(
+        self,
+        conn: sqlite3.Connection,
+        term: str,
+        owner_scope: str | None = None,
+        resolution: EntityResolution | None = None,
+    ) -> list[ContactRow]:
         rows: list[ContactRow] = []
         seen: set[str] = set()
+        resolution = resolution or self._resolve_entity(conn, term, owner_scope=owner_scope)
 
-        for match in self._entity_matches(conn, term, owner_scope=owner_scope):
+        for match in self._entity_matches(conn, term, owner_scope=owner_scope, resolution=resolution):
             label = match.get("contact_name") or match.get("full_name") or match.get("company_name") or "Sin nombre"
             email = match.get("email") or "Sin correo"
             phone = match.get("phone") or "Sin telefono"
@@ -816,7 +970,7 @@ class SalesAssistantService:
                 seen.add(key)
                 rows.append(row)
 
-        for note in self._recent_notes_for_entity(conn, term, owner_scope=owner_scope):
+        for note in self._recent_notes_for_entity(conn, term, owner_scope=owner_scope, resolution=resolution):
             for row in self._extract_contacts_from_note(note):
                 key = self._contact_row_key(row)
                 if key not in seen:
@@ -1263,6 +1417,124 @@ class SalesAssistantService:
             "latest_touch": latest_touch,
             "unit_rows": [row for row in profiles if row.get("unit_count")],
         }
+
+    def _entity_count_summary(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> dict[str, Any]:
+        profiles = self._entity_profile_rows(conn, term, owner_scope=owner_scope)
+        interactions = self._recent_interactions_for_entity(conn, term, owner_scope=owner_scope)
+        notes = self._recent_notes_for_entity(conn, term, owner_scope=owner_scope)
+        leads = sum(1 for row in profiles if row.get("entity_type") == "lead")
+        contacts = sum(1 for row in profiles if row.get("entity_type") == "contact")
+        canonical_name = profiles[0].get("company_name") if profiles else term
+        return {
+            "entity_name": canonical_name or term,
+            "total_profiles": len(profiles),
+            "lead_count": leads,
+            "contact_count": contacts,
+            "interaction_count": len(interactions),
+            "note_count": len(notes),
+        }
+
+    def _owner_client_count_summary(self, conn: sqlite3.Connection, owner_scope: str) -> dict[str, Any]:
+        rows = self._assigned_clients(conn, owner_scope)
+        unique_labels: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            label = row.get("company_name") or row.get("contact_name") or row.get("full_name")
+            if not label:
+                continue
+            key = self._normalize_search_text(label)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_labels.append(label)
+        return {
+            "owner_name": owner_scope,
+            "total_accounts": len(unique_labels),
+            "sample_accounts": unique_labels[:5],
+        }
+
+    def _extract_rank_limit(self, normalized_question: str) -> int:
+        digit_match = re.search(r"\btop\s+(\d+)\b|\b(\d+)\s+(?:clientes|prospectos|cuentas)\b", normalized_question)
+        if digit_match:
+            value = next((group for group in digit_match.groups() if group), None)
+            if value:
+                return max(1, min(10, int(value)))
+        text_numbers = {
+            "uno": 1,
+            "dos": 2,
+            "tres": 3,
+            "cuatro": 4,
+            "cinco": 5,
+            "seis": 6,
+            "siete": 7,
+            "ocho": 8,
+            "nueve": 9,
+            "diez": 10,
+        }
+        for word, value in text_numbers.items():
+            if re.search(rf"\b{word}\b", normalized_question):
+                return value
+        return 3
+
+    def _owner_ranked_accounts(self, conn: sqlite3.Connection, owner_scope: str, limit: int = 3) -> list[dict[str, Any]]:
+        query = """
+        SELECT
+            related_name,
+            COUNT(*) AS total_interactions,
+            SUM(CASE WHEN source_type = 'note' THEN 1 ELSE 0 END) AS note_count,
+            SUM(CASE WHEN source_type = 'call' THEN 1 ELSE 0 END) AS call_count,
+            MAX(interaction_at) AS last_touch
+        FROM interactions
+        WHERE owner_name = ?
+          AND related_name IS NOT NULL
+          AND trim(related_name) <> ''
+        GROUP BY related_name
+        ORDER BY MAX(interaction_at) DESC
+        LIMIT 60
+        """
+        rows = [dict(row) for row in conn.execute(query, (owner_scope,)).fetchall()]
+        ranked: list[dict[str, Any]] = []
+        for row in rows:
+            related_name = row.get("related_name")
+            if not related_name or self._normalize_search_text(related_name) in {"sin nombre", "sin contacto"}:
+                continue
+            pending = len(self._entity_pending_tasks(conn, related_name, owner_scope=owner_scope))
+            brief = self._entity_brief(conn, related_name, owner_scope=owner_scope, question=f"resumen de {related_name}")
+            signals = brief.get("insights", {}).get("signals") or []
+            last_touch = row.get("last_touch")
+            recency_bonus = 0
+            if last_touch:
+                try:
+                    parsed_touch = datetime.fromisoformat(str(last_touch).replace("Z", "+00:00"))
+                    if parsed_touch.tzinfo is not None:
+                        parsed_touch = parsed_touch.replace(tzinfo=None)
+                    days_old = max(0, (datetime.now() - parsed_touch).days)
+                    recency_bonus = max(0, 12 - min(days_old, 12))
+                except ValueError:
+                    recency_bonus = 0
+            score = (
+                int(row.get("total_interactions") or 0) * 3
+                + int(row.get("note_count") or 0) * 2
+                + int(row.get("call_count") or 0) * 3
+                + pending * 4
+                + recency_bonus
+                + len(signals) * 4
+            )
+            ranked.append(
+                {
+                    "entity_name": related_name,
+                    "score": score,
+                    "total_interactions": int(row.get("total_interactions") or 0),
+                    "note_count": int(row.get("note_count") or 0),
+                    "call_count": int(row.get("call_count") or 0),
+                    "pending_tasks": pending,
+                    "last_touch": last_touch,
+                    "signals": signals[:2],
+                    "next_step": brief.get("insights", {}).get("next_step"),
+                }
+            )
+        ranked.sort(key=lambda item: (-item["score"], -(item["call_count"]), -(item["note_count"]), item["entity_name"]))
+        return ranked[:limit]
 
     def _owner_brief(self, conn: sqlite3.Connection, owner_scope: str | None) -> dict[str, Any]:
         if not owner_scope:
@@ -1919,6 +2191,9 @@ class SalesAssistantService:
                 " mi cartera",
                 " dinero en la mesa ",
                 " oportunidades ",
+                " si solo pudiera hacer una accion hoy ",
+                " que tres clientes debo atacar primero esta semana ",
+                " conclusion y luego evidencia sobre mi cartera ",
             ]
             if any(signal in padded for signal in self_scope_signals):
                 return user.crm_owner_name
@@ -1946,6 +2221,9 @@ class SalesAssistantService:
             "analiza mis notas",
             "que oportunidades tengo",
             "dinero en la mesa",
+            "si solo pudiera hacer una accion hoy",
+            "que tres clientes debo atacar primero esta semana",
+            "dame primero conclusion y luego evidencia sobre mi cartera",
         ]
         if any(self._normalize_search_text(signal) in normalized for signal in seller_default_signals):
             return user.crm_owner_name
@@ -1995,6 +2273,7 @@ class SalesAssistantService:
             "comparativa ",
             "dame ",
             "solo ",
+            "de alta",
             "cliente ",
             "prospecto ",
             "contacto ",
@@ -2515,10 +2794,72 @@ class SalesAssistantService:
             lines.append(f"Unidades reportadas: {row.get('unit_count')}{unit_suffix}")
         return "\n".join(lines)
 
+    def _format_entity_suggestions(self, term: str, suggestions: list[str]) -> str:
+        if not suggestions:
+            return f'No encontre informacion registrada para "{term}".'
+        lines = [f'No encontre informacion registrada exactamente para "{term}".']
+        lines.append("Lo mas cercano que si veo en CRM es:")
+        lines.extend(f"- {name}" for name in suggestions[:3])
+        lines.append("Si quieres, prueba con uno de esos nombres y te doy el resumen, plan o contactos.")
+        return "\n".join(lines)
+
+    def _format_entity_count_summary(self, summary: dict[str, Any]) -> str:
+        if not summary:
+            return "No encontre registros para esa cuenta."
+        return "\n".join(
+            [
+                f"Registros detectados para {summary.get('entity_name') or 'la cuenta solicitada'}:",
+                f"- Fichas estructuradas en CRM: {summary.get('total_profiles', 0)}",
+                f"- Leads: {summary.get('lead_count', 0)}",
+                f"- Contacts: {summary.get('contact_count', 0)}",
+                f"- Interacciones recientes detectadas: {summary.get('interaction_count', 0)}",
+                f"- Notas CRM detectadas: {summary.get('note_count', 0)}",
+            ]
+        )
+
+    def _format_owner_client_count_summary(self, summary: dict[str, Any], owner_scope: str | None) -> str:
+        if not summary:
+            owner_label = owner_scope or "ese vendedor"
+            return f"No encontre clientes o prospectos visibles para {owner_label}."
+        lines = [
+            f"{summary.get('owner_name') or owner_scope or 'Ese vendedor'} tiene {summary.get('total_accounts', 0)} clientes o prospectos visibles en leads/contacts."
+        ]
+        sample_accounts = summary.get("sample_accounts") or []
+        if sample_accounts:
+            lines.append("Ejemplos:")
+            lines.extend(f"- {label}" for label in sample_accounts[:5])
+        return "\n".join(lines)
+
     def _format_owner_load(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "No encontre propietarios con registros."
         return "\n".join(f"{row['owner_name']}: {row['total_records']}" for row in rows)
+
+    def _format_owner_ranked_accounts(self, rows: list[dict[str, Any]], owner_scope: str | None, limit: int) -> str:
+        if not rows:
+            owner_label = owner_scope or "ese vendedor"
+            return f"No encontre cuentas suficientes para rankear a {owner_label}."
+        owner_label = owner_scope or "ese vendedor"
+        lines = [f"Top {min(limit, len(rows))} clientes o prospectos de {owner_label}:"]
+        for index, row in enumerate(rows[:limit], start=1):
+            reasons = []
+            if row.get("total_interactions"):
+                reasons.append(f"{row['total_interactions']} interacciones")
+            if row.get("note_count"):
+                reasons.append(f"{row['note_count']} notas")
+            if row.get("call_count"):
+                reasons.append(f"{row['call_count']} llamadas")
+            if row.get("pending_tasks"):
+                reasons.append(f"{row['pending_tasks']} pendientes")
+            signals = row.get("signals") or []
+            if signals:
+                reasons.append(signals[0])
+            reason_text = ", ".join(reasons) if reasons else "actividad comercial visible"
+            line = f"{index}. {row['entity_name']} | {reason_text}"
+            if row.get("next_step"):
+                line += f" | Siguiente paso: {row['next_step']}"
+            lines.append(line)
+        return "\n".join(lines)
 
     def _format_assigned_clients(self, rows: list[dict[str, Any]], owner_scope: str | None) -> str:
         if not rows:
@@ -2832,6 +3173,8 @@ class SalesAssistantService:
             sections.append(self._format_owner_brief(evidence["owner_brief"], evidence.get("owner_scope")))
         elif evidence.get("team_brief"):
             sections.append(self._format_team_brief(evidence["team_brief"]))
+        elif evidence.get("entity_suggestions") and evidence.get("entity_hint"):
+            sections.append(self._format_entity_suggestions(evidence["entity_hint"], evidence["entity_suggestions"]))
         if evidence.get("recent_interactions"):
             sections.append("Interacciones recientes:\n" + self._format_interaction_list(evidence["recent_interactions"], ""))
         if evidence.get("recent_notes"):

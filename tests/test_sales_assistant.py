@@ -136,6 +136,52 @@ class SalesAssistantServiceTests(unittest.TestCase):
         )
         self.assertEqual(parts[1], "redactame un correo para movimex")
 
+    def test_question_mark_compound_keeps_entity_context(self) -> None:
+        parts = self.service._contextualize_subquestions(
+            "que notas hay de jibo? cuantos clientes o prospectos estan registrados a ese nombre?",
+            ["que notas hay de jibo", "cuantos clientes o prospectos estan registrados a ese nombre"],
+        )
+        self.assertIn("jibo", parts[1].lower())
+
+    def test_best_clients_for_owner_returns_ranked_shortlist(self) -> None:
+        response = self.service.answer_question("los mejores tres clientes de Eduardo y por que")
+        answer = response.answer.lower()
+        self.assertIn("top 3", answer)
+        self.assertIn("eduardo valdez", answer)
+        self.assertNotIn("clientes y prospectos de eduardo valdez", answer)
+
+    def test_count_my_clients_uses_logged_owner_scope(self) -> None:
+        response = self.service.answer_question("cuantos clientes tengo registrados o dados de alta?", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("jesus emmanuel meza", answer)
+        self.assertIn("clientes o prospectos visibles", answer)
+        self.assertNotIn("ventura rios", answer)
+
+    def test_count_for_entity_returns_entity_summary(self) -> None:
+        response = self.service.answer_question("cuantos clientes o prospectos estan registrados con jibe?")
+        answer = response.answer.lower()
+        self.assertIn("registros detectados", answer)
+        self.assertIn("jibe", answer)
+        self.assertNotIn("ventura rios", answer)
+
+    def test_fuzzy_jibo_does_not_hallucinate_other_account(self) -> None:
+        response = self.service.answer_question("que me dices de jibo? que plan de accion me recomiendas para el?")
+        answer = response.answer.lower()
+        self.assertNotIn("la loma base para helados", answer)
+        self.assertTrue("jibe" in answer or "no encontre informacion registrada exactamente" in answer)
+
+    def test_typo_entity_returns_suggestions_instead_of_wrong_account(self) -> None:
+        response = self.service.answer_question("que notas hay de jibo?")
+        answer = response.answer.lower()
+        self.assertNotIn("transportes morquecho", answer)
+        self.assertTrue("lo mas cercano" in answer or "jibe" in answer)
+
+    def test_precall_brief_query_should_be_treated_as_client_brief(self) -> None:
+        response = self.service.answer_question("si entro a una llamada en 5 minutos con movimex, que debo tener claro")
+        answer = response.answer.lower()
+        self.assertIn("movimex", answer)
+        self.assertNotIn("no encontre evidencia suficiente para responder", answer)
+
 
 class HistoryIsolationTests(unittest.TestCase):
     def test_history_can_be_filtered_by_username(self) -> None:

@@ -90,6 +90,9 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
         {"username": "emeza", "question": "donde estoy dejando dinero en la mesa"},
         {"username": "emeza", "question": "dame mis oportunidades mas fuertes y escribe un correo para la principal"},
         {"username": "emeza", "question": "dame mis clientes calientes y luego armame mensaje para el mejor"},
+        {"username": "emeza", "question": "si solo pudiera hacer una accion hoy, cual seria y por que"},
+        {"username": "emeza", "question": "que tres clientes debo atacar primero esta semana y con que enfoque"},
+        {"username": "emeza", "question": "dame primero conclusion y luego evidencia sobre mi cartera"},
     ]
     questions.extend(base_self_questions)
 
@@ -117,6 +120,10 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
                 {"username": "emeza", "question": f"hazme argumentos de venta para una llamada con {entity}"},
                 {"username": "emeza", "question": f"que harias hoy, manana y esta semana con {entity}"},
                 {"username": "emeza", "question": f"dame resumen de {entity} y luego redactame un correo"},
+                {"username": "emeza", "question": f"dame un whatsapp corto para darle seguimiento a {entity}"},
+                {"username": "emeza", "question": f"resumeme {entity} en contexto, riesgo y siguiente paso"},
+                {"username": "emeza", "question": f"si entro a una llamada en 5 minutos con {entity}, que debo tener claro"},
+                {"username": "emeza", "question": f"dame objeciones probables y como responderlas para {entity}"},
             ]
         )
 
@@ -136,7 +143,17 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
                 "question": f"hazme un resumen ejecutivo de {entity}",
             }
         )
-    return questions[:110]
+    questions.extend(
+        [
+            {"username": "emeza", "question": "jibo"},
+            {"username": "emeza", "question": "que notas hay de jibo? cuantos clientes o prospectos estan registrados a ese nombre?"},
+            {"username": "emeza", "question": "que me dices de jibo? que plan de accion me recomiendas para el?"},
+            {"username": "emeza", "question": "los mejores tres clientes de Eduardo y por que"},
+            {"username": "emeza", "question": "cuantos clientes tengo registrados o dados de alta?"},
+            {"username": "emeza", "question": "cuantos clientes o prospectos estan registrados con jibe?"},
+        ]
+    )
+    return questions[:140]
 
 
 def evaluate_questions(db_path: Path, output_dir: Path) -> Path:
