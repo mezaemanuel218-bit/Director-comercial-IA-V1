@@ -12,6 +12,7 @@ from openai import OpenAI
 
 from assistant_core.auth import APP_USERS, AppUser
 from assistant_core.config import WAREHOUSE_DB
+from assistant_core.history import fetch_history
 from assistant_core.query_intent import QuestionIntent, classify_question
 from assistant_core.utils import strip_html
 
@@ -49,6 +50,30 @@ class EntityResolution:
     confidence: float = 0.0
 
 
+@dataclass
+class TaskInterpretation:
+    task_type: str
+    desired_format: str
+    response_style: str
+    depth: str
+    asks_for_recommendation: bool
+    asks_for_creation: bool
+    asks_for_comparison: bool
+    asks_for_summary: bool
+    asks_for_action: bool
+
+
+@dataclass
+class EvidencePack:
+    question: str
+    owner_scope: str | None
+    entity_hint: str | None
+    entity_name: str | None
+    active_user: dict[str, Any] | None
+    task: TaskInterpretation
+    evidence: dict[str, Any]
+
+
 class SalesAssistantService:
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path = db_path or str(WAREHOUSE_DB)
@@ -78,18 +103,27 @@ class SalesAssistantService:
         evidence = self._collect_evidence(effective_question, intent, owner_scope=owner_scope)
         evidence["active_user"] = self._user_context(user)
         evidence["owner_scope"] = owner_scope
+        task = self._interpret_task(effective_question, intent, evidence)
+        pack = self._build_evidence_pack(effective_question, evidence, task, user)
+        evidence["task"] = task.__dict__
+        evidence["evidence_pack"] = {
+            "entity_name": pack.entity_name,
+            "desired_format": pack.task.desired_format,
+            "response_style": pack.task.response_style,
+            "depth": pack.task.depth,
+        }
 
-        if evidence.get("direct_answer") and self._should_prefer_direct_answer(intent, evidence):
+        if evidence.get("direct_answer") and self._should_prefer_direct_answer(intent, evidence, task):
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
                 used_web=False,
-                answer=evidence["direct_answer"],
+                answer=self._compose_fallback_answer(pack),
                 evidence=evidence,
             )
 
         if not self.client:
-            fallback = evidence.get("direct_answer") or self._format_evidence_fallback(evidence)
+            fallback = self._compose_fallback_answer(pack)
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
@@ -98,15 +132,15 @@ class SalesAssistantService:
                 evidence=evidence,
             )
 
-        prompt = self._build_prompt(effective_question, intent, evidence)
+        prompt = self._build_prompt(effective_question, intent, evidence, pack)
         response = self.client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[{"role": "user", "content": prompt}],
         )
         content = (response.choices[0].message.content or "").strip()
-        answer = content or evidence.get("direct_answer") or self._format_evidence_fallback(evidence)
+        answer = content or self._compose_fallback_answer(pack)
         if self._response_looks_empty(answer) and evidence.get("direct_answer"):
-            answer = evidence["direct_answer"]
+            answer = self._compose_fallback_answer(pack)
         return AssistantResponse(
             mode=intent.mode,
             sources=evidence["sources"],
@@ -365,17 +399,181 @@ class SalesAssistantService:
             return None
         return rows[0].get("related_name")
 
-    def _should_prefer_direct_answer(self, intent: QuestionIntent, evidence: dict[str, Any]) -> bool:
-        if intent.mode == "data" and not any(
-            [
-                intent.asks_for_sales_draft,
-                intent.asks_for_action_plan,
-                intent.asks_for_sales_material,
-                intent.asks_for_formatted_output,
-                intent.asks_for_multi_step,
+    def _interpret_task(self, question: str, intent: QuestionIntent, evidence: dict[str, Any]) -> TaskInterpretation:
+        normalized = self._normalize_search_text(question)
+        asks_for_creation = bool(intent.asks_for_sales_draft or intent.asks_for_sales_material)
+        asks_for_summary = bool(intent.asks_for_client_brief or intent.asks_for_owner_brief or intent.asks_for_team_brief)
+        asks_for_action = bool(
+            intent.asks_for_action_plan
+            or intent.asks_for_today_call_list
+            or "plan de trabajo" in normalized
+            or "siguiente paso" in normalized
+            or "que haria" in normalized
+            or "que harias" in normalized
+            or "debo " in normalized
+            or "recomiendas" in normalized
+        )
+        asks_for_recommendation = asks_for_action or any(
+            token in normalized
+            for token in [
+                "por que",
+                "conviene",
+                "vale la pena",
+                "decision maker",
+                "que cliente",
+                "mejor",
+                "top",
+                "prioriza",
             ]
-        ):
-            return True
+        )
+        desired_format = "default"
+        if "correo" in normalized or "mail" in normalized or "email" in normalized:
+            desired_format = "email"
+        elif "whatsapp" in normalized or "mensaje" in normalized:
+            desired_format = "message"
+        elif "bullets" in normalized:
+            desired_format = "bullets"
+        elif "conclusion y luego evidencia" in normalized or "conclusion primero" in normalized:
+            desired_format = "conclusion_evidence"
+        elif "plan" in normalized:
+            desired_format = "plan"
+        elif "ejecutivo" in normalized or "brief" in normalized:
+            desired_format = "executive"
+
+        task_type = "lookup"
+        if asks_for_creation:
+            task_type = "create"
+        elif intent.asks_for_comparison:
+            task_type = "compare"
+        elif asks_for_action:
+            task_type = "recommend"
+        elif asks_for_summary:
+            task_type = "summarize"
+        elif intent.asks_for_kpis:
+            task_type = "metrics"
+
+        response_style = "commercial_advisor" if task_type in {"recommend", "create", "compare", "summarize"} else "concise_data"
+        depth = "deep" if any(token in normalized for token in ["todo lo que debo saber", "analiza", "explicame", "resume", "resumeme", "como vamos"]) else "standard"
+        if desired_format in {"email", "message", "plan", "executive", "conclusion_evidence"}:
+            depth = "deep"
+
+        return TaskInterpretation(
+            task_type=task_type,
+            desired_format=desired_format,
+            response_style=response_style,
+            depth=depth,
+            asks_for_recommendation=asks_for_recommendation,
+            asks_for_creation=asks_for_creation,
+            asks_for_comparison=bool(intent.asks_for_comparison),
+            asks_for_summary=asks_for_summary,
+            asks_for_action=asks_for_action,
+        )
+
+    def _build_evidence_pack(
+        self,
+        question: str,
+        evidence: dict[str, Any],
+        task: TaskInterpretation,
+        user: AppUser | None,
+    ) -> EvidencePack:
+        entity_name = None
+        entity_brief = evidence.get("entity_brief") or {}
+        latest_row = entity_brief.get("latest_row") or {}
+        entity_name = (
+            latest_row.get("company_name")
+            or latest_row.get("contact_name")
+            or latest_row.get("full_name")
+            or evidence.get("entity_resolution", {}).get("canonical_name")
+            or evidence.get("entity_hint")
+        )
+        recent_history = []
+        try:
+            if user:
+                recent_history = fetch_history(limit=6, username=user.username)
+        except Exception:
+            recent_history = []
+        evidence["recent_history"] = recent_history
+        return EvidencePack(
+            question=question,
+            owner_scope=evidence.get("owner_scope"),
+            entity_hint=evidence.get("entity_hint"),
+            entity_name=entity_name,
+            active_user=evidence.get("active_user"),
+            task=task,
+            evidence=evidence,
+        )
+
+    def _compose_fallback_answer(self, pack: EvidencePack) -> str:
+        evidence = pack.evidence
+        task = pack.task
+        if task.desired_format == "conclusion_evidence":
+            return self._format_conclusion_then_evidence(pack)
+        if evidence.get("action_plan"):
+            return self._format_action_plan(evidence["action_plan"])
+        if task.task_type in {"recommend", "summarize"} and evidence.get("owner_brief") and not evidence.get("entity_brief"):
+            return self._format_owner_brief(pack.evidence["owner_brief"], pack.owner_scope)
+        if task.task_type == "create" and evidence.get("sales_draft"):
+            return self._format_sales_draft(evidence["sales_draft"])
+        if task.task_type == "create" and evidence.get("sales_material"):
+            return self._format_sales_material(evidence["sales_material"])
+        return evidence.get("direct_answer") or self._format_evidence_fallback(evidence)
+
+    def _format_conclusion_then_evidence(self, pack: EvidencePack) -> str:
+        evidence = pack.evidence
+        if evidence.get("owner_brief"):
+            brief = evidence["owner_brief"]
+            priorities = brief.get("priorities") or []
+            pending = brief.get("pending_tasks") or []
+            lines = []
+            owner_name = brief.get("owner_name") or pack.owner_scope or "tu cartera"
+            if priorities:
+                top = priorities[0]
+                lines.append(f"Conclusion: la cuenta que mas urge mover en {owner_name} es {top.get('related_name') or 'la principal visible'}.")
+            else:
+                lines.append(f"Conclusion: veo cartera activa en {owner_name}, pero sin una cuenta claramente dominante en este momento.")
+            lines.append("")
+            lines.append("Evidencia:")
+            lines.append(self._format_owner_brief(brief, pack.owner_scope))
+            if pending:
+                lines.append("")
+                lines.append("Lectura comercial:")
+                lines.append("Hay compromisos pendientes, asi que conviene concentrar seguimiento y convertir actividad reciente en siguiente paso con fecha.")
+            return "\n".join(lines)
+        if evidence.get("entity_brief"):
+            brief = evidence["entity_brief"]
+            lines = [f"Conclusion: {brief.get('entity_term') or pack.entity_name or 'La cuenta'} tiene contexto suficiente para una siguiente accion comercial."]
+            lines.append("")
+            lines.append("Evidencia:")
+            lines.append(self._format_entity_brief(brief))
+            return "\n".join(lines)
+        return evidence.get("direct_answer") or self._format_evidence_fallback(evidence)
+
+    def _should_prefer_direct_answer(self, intent: QuestionIntent, evidence: dict[str, Any], task: TaskInterpretation) -> bool:
+        if task.task_type in {"create", "recommend", "summarize", "compare"}:
+            return False
+        if task.desired_format != "default":
+            return False
+        if intent.asks_for_multi_step or intent.asks_for_formatted_output:
+            return False
+        if intent.mode == "data" and task.task_type in {"lookup", "metrics"}:
+            simple_keys = [
+                "contact_rows",
+                "matches",
+                "pending_tasks",
+                "today_pending",
+                "latest_note",
+                "latest_contacted",
+                "recent_activity_by_owner",
+                "assigned_clients",
+                "owner_load",
+                "owner_client_count",
+                "entity_count_summary",
+                "owner_kpis",
+                "global_kpis",
+                "entity_kpis",
+            ]
+            if any(evidence.get(key) for key in simple_keys):
+                return True
         structured_keys = [
             "entity_brief",
             "owner_brief",
@@ -416,6 +614,8 @@ class SalesAssistantService:
     def _collect_evidence(self, question: str, intent: QuestionIntent, owner_scope: str | None = None) -> dict[str, Any]:
         entity_term = self._extract_entity_hint(question)
         normalized_question = self._normalize_search_text(question)
+        if owner_scope and "comercialmente" in normalized_question:
+            entity_term = None
         evidence: dict[str, Any] = {
             "sources": ["warehouse.db"],
             "entity_hint": entity_term,
@@ -458,12 +658,18 @@ class SalesAssistantService:
                 limit = self._extract_rank_limit(normalized_question)
                 evidence["ranked_accounts"] = self._owner_ranked_accounts(conn, owner_scope, limit=limit)
                 evidence["direct_answer"] = self._format_owner_ranked_accounts(evidence["ranked_accounts"], owner_scope, limit)
+            elif owner_scope and not entity_term and any(token in normalized_question for token in ["como va", "comercialmente"]):
+                evidence["owner_brief"] = self._owner_brief(conn, owner_scope)
+                evidence["direct_answer"] = self._format_owner_brief(evidence["owner_brief"], owner_scope)
             elif asks_for_count and entity_term and entity_has_evidence:
                 evidence["entity_count_summary"] = self._entity_count_summary(conn, entity_term, owner_scope=owner_scope)
                 evidence["direct_answer"] = self._format_entity_count_summary(evidence["entity_count_summary"])
             elif asks_for_count and owner_scope and any(token in normalized_question for token in ["cliente", "clientes", "prospecto", "prospectos", "lead", "leads", "cuenta", "cuentas"]):
                 evidence["owner_client_count"] = self._owner_client_count_summary(conn, owner_scope)
                 evidence["direct_answer"] = self._format_owner_client_count_summary(evidence["owner_client_count"], owner_scope)
+            elif entity_term and entity_has_evidence and any(token in normalized_question for token in ["decision maker", "vale la pena seguir insistiendo"]):
+                evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
+                evidence["direct_answer"] = self._format_entity_brief(evidence["entity_brief"])
             elif intent.asks_for_action_plan:
                 if entity_term and entity_has_evidence:
                     evidence["entity_brief"] = self._entity_brief(conn, entity_term, owner_scope=owner_scope, question=question)
@@ -532,7 +738,7 @@ class SalesAssistantService:
                 evidence["direct_answer"] = self._format_latest_note(evidence["latest_note"], owner_scope)
             elif intent.asks_for_today_pending:
                 evidence["today_pending"] = self._today_pending(conn, owner_scope)
-                evidence["direct_answer"] = self._format_today_pending(evidence["today_pending"])
+                evidence["direct_answer"] = self._format_today_pending_with_context(conn, evidence["today_pending"], owner_scope)
             elif intent.asks_for_pending_commitments:
                 evidence["pending_tasks"] = self._pending_tasks(conn, owner_scope)
                 evidence["direct_answer"] = self._format_pending_tasks(evidence["pending_tasks"])
@@ -613,6 +819,19 @@ class SalesAssistantService:
 
     def _extract_entity_hint(self, question: str) -> str | None:
         normalized = self._normalize_search_text(question)
+        generic_phrases = [
+            "analiza mis notas y arma un plan para hoy",
+            "en base a mis notas, que me recomiendas hacer hoy",
+            "dame todo lo que debo saber de mis contactos o leads",
+            "dame todo lo que debo saber de mis contactos",
+            "dame todo lo que debo saber de mis leads",
+            "mis contactos o leads",
+            "mi cartera",
+        ]
+        if any(phrase in normalized for phrase in generic_phrases):
+            return None
+        if "min libres" in normalized and "plan de trabajo" in normalized:
+            return None
         sales_patterns = [
             r"(?:mandarle|enviarle|escribirle)\s+a\s+(.+?)(?:,|$)",
             r"(?:correo|mail|email|mensaje)\s+(?:para|a)\s+(.+?)(?:,|$)",
@@ -632,7 +851,10 @@ class SalesAssistantService:
                 return trailing
         specific_patterns = [
             r"kpi(?:s)?\s+(.+?)\s+de\s+la\s+semana$",
+            r"como vamos con\s+(.+)$",
             r"que sigue con\s+(.+)$",
+            r"que decision maker ves en\s+(.+)$",
+            r"vale la pena seguir insistiendo con\s+(.+)$",
             r"que objeciones?(?:\s+hay)?\s+(?:en|de)\s+(.+)$",
             r"que objeciones?\s+tiene\s+(.+)$",
             r"hazme un resumen ejecutivo de\s+(.+)$",
@@ -2146,7 +2368,13 @@ class SalesAssistantService:
             for row in rows:
                 owner_name = row[0]
                 key = self._normalize_search_text(owner_name)
-                aliases[key] = owner_name
+                aliases.setdefault(key, owner_name)
+                compact_key = key.replace(" ", "")
+                if compact_key:
+                    aliases.setdefault(compact_key, owner_name)
+                tokens = [token for token in key.split() if len(token) >= 4 and token not in {"leads", "owner", "owners", "soporte", "ayuda", "consultoria"}]
+                if tokens:
+                    aliases.setdefault(tokens[0], owner_name)
 
         matches = []
         for alias, owner_name in aliases.items():
@@ -2263,6 +2491,7 @@ class SalesAssistantService:
     def _normalize_search_text(self, value: str) -> str:
         normalized = unicodedata.normalize("NFKD", value or "")
         ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+        ascii_text = ascii_text.replace("_", " ")
         return " ".join(ascii_text.lower().split())
 
     def _clean_search_term(self, value: str) -> str:
@@ -2943,6 +3172,20 @@ class SalesAssistantService:
             )
         return "\n".join(lines)
 
+    def _format_today_pending_with_context(self, conn: sqlite3.Connection, rows: list[dict[str, Any]], owner_scope: str | None) -> str:
+        if rows:
+            return self._format_today_pending(rows)
+        recent = self._recent_activity_by_owner(conn, owner_scope)
+        owner_label = owner_scope or "ese owner"
+        if recent:
+            lines = [f"No veo compromisos de hoy para {owner_label}. Lo mas reciente visible es:"]
+            for row in recent[:3]:
+                lines.append(
+                    f"- {row.get('interaction_at') or '-'} | {row.get('related_name') or 'Sin nombre'} | {row.get('source_type') or '-'}"
+                )
+            return "\n".join(lines)
+        return f"No veo compromisos de hoy ni actividad reciente visible para {owner_label}."
+
     def _format_stale_contacts(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "No encontre clientes con mas de 30 dias sin contacto."
@@ -3189,47 +3432,96 @@ class SalesAssistantService:
             sections.append("Documentos:\n" + "\n".join(doc_lines))
         return "\n\n".join(section for section in sections if section.strip()) or "No encontre evidencia suficiente para responder."
 
-    def _build_prompt(self, question: str, intent: QuestionIntent, evidence: dict[str, Any]) -> str:
+    def _build_prompt(self, question: str, intent: QuestionIntent, evidence: dict[str, Any], pack: EvidencePack) -> str:
         def serialize_rows(rows: list[dict[str, Any]], limit: int = 8) -> str:
             return "\n".join(f"- {row}" for row in rows[:limit]) if rows else "- Sin registros"
 
+        def serialize_history(rows: list[dict[str, Any]], limit: int = 5) -> str:
+            snippets = []
+            for row in rows[:limit]:
+                answer = (row.get("answer") or "").strip().replace("\n", " ")
+                if len(answer) > 180:
+                    answer = answer[:177] + "..."
+                snippets.append(
+                    f"- {row.get('question') or ''} -> {answer or 'Sin respuesta registrada'}"
+                )
+            return "\n".join(snippets) if snippets else "- Sin historial reciente"
+
+        task = pack.task
         instructions = [
             "Eres el asistente comercial del equipo Flotimatics.",
-            "Ayudas a direccion y vendedores con KPIs, cartera, comparativas, historial de notas, compromisos, llamadas y contexto comercial por cliente.",
-            "Responde en español claro, ejecutivo y accionable.",
+            "Piensa y respondes como un gerente comercial fuerte, no como un simple buscador del CRM.",
+            "Ayudas a direccion y vendedores con KPIs, cartera, comparativas, historial de notas, compromisos, llamadas, oportunidades y contexto comercial por cliente.",
+            "Responde en español claro, natural, ejecutivo y accionable.",
             "Usa solo la evidencia proporcionada de Zoho CRM y PDFs locales.",
             "No inventes contactos, teléfonos, correos, responsables, unidades ni conclusiones.",
             "Si la evidencia es parcial, entrega lo que sí está respaldado y di claramente lo que falta.",
             "Cuando la pregunta sea amplia, sintetiza primero el panorama y luego baja a datos concretos.",
             "Si te piden propuesta, comentario comercial, formato, redaccion o plan, responde como asesor comercial y no solo como buscador de datos.",
+            "No repitas bloques mecanicos ni enumeres de mas si una respuesta mas fluida funciona mejor.",
+            "Si el usuario pide estrategia, opinion, ranking, lectura comercial o plan, debes interpretar la evidencia y proponer un siguiente paso util.",
+            "Si el usuario pide crear algo, entrega una pieza lista para usar.",
+            "Si hay varias subsolicitudes en una misma pregunta, integralas en una sola respuesta coherente cuando sea posible.",
+            "Si el contexto es rico, puedes responder largo. Si el usuario solo pidio un dato puntual, responde corto.",
         ]
-        if intent.mode == "data":
+        if task.response_style == "commercial_advisor":
+            instructions.append("Prioriza una respuesta con criterio comercial, conclusion, evidencia relevante y siguiente paso.")
+        if task.desired_format == "email":
+            instructions.append("Entrega un correo listo para enviar, con asunto y cuerpo natural. Usa tono humano y comercial.")
+        elif task.desired_format == "message":
+            instructions.append("Entrega un mensaje corto y natural, listo para enviar por WhatsApp o mensaje.")
+        elif task.desired_format == "bullets":
+            instructions.append("Entrega la respuesta en bullets claros y ejecutivos.")
+        elif task.desired_format == "plan":
+            instructions.append("Entrega un plan de accion claro, priorizado y aterrizado a hoy/manana/esta semana si aplica.")
+        elif task.desired_format == "executive":
+            instructions.append("Entrega un brief ejecutivo: lectura actual, riesgos, oportunidad y siguiente paso.")
+        elif task.desired_format == "conclusion_evidence":
+            instructions.append("Entrega primero una conclusion clara y luego la evidencia que la respalda.")
+        elif intent.mode == "data" and task.task_type in {"lookup", "metrics"}:
             instructions.append("Como la consulta es de datos, responde de forma breve y directa.")
         else:
-            instructions.append("Como la consulta es analítica, separa Hechos, Interpretación y Recomendación cuando ayude.")
+            instructions.append("Si ayuda, separa conclusion, evidencia y recomendacion, pero sin sonar acartonado.")
 
         prompt_parts = [
             "\n".join(instructions),
             f"Pregunta: {question}",
-            f"Usuario activo: {evidence.get('active_user')}",
-            f"Vendedor aplicado: {evidence.get('owner_scope')}",
-            f"Entidad detectada: {evidence.get('entity_hint')}",
+            f"Tipo de tarea interpretado: {task.task_type}",
+            f"Formato deseado: {task.desired_format}",
+            f"Profundidad esperada: {task.depth}",
+            f"Usuario activo: {pack.active_user}",
+            f"Vendedor aplicado: {pack.owner_scope}",
+            f"Entidad detectada: {pack.entity_hint}",
+            f"Entidad canonica: {pack.entity_name}",
+            "Historial reciente del usuario:\n" + serialize_history(evidence.get("recent_history", [])),
             f"Resumen cliente: {evidence.get('entity_brief')}",
             f"Resumen vendedor: {evidence.get('owner_brief')}",
             f"Resumen equipo: {evidence.get('team_brief')}",
             f"Plan sugerido: {evidence.get('action_plan')}",
             f"Material comercial sugerido: {evidence.get('sales_material')}",
             f"Borrador comercial sugerido: {evidence.get('sales_draft')}",
+            f"Resolucion de entidad: {evidence.get('entity_resolution')}",
+            f"Sugerencias de entidad: {evidence.get('entity_suggestions')}",
             "Coincidencias CRM:\n" + serialize_rows(evidence.get("matches", [])),
             "Contactos detectados:\n" + serialize_rows(evidence.get("contact_rows", [])),
             "Interacciones recientes:\n" + serialize_rows(evidence.get("recent_interactions", [])),
             "Notas recientes:\n" + serialize_rows(evidence.get("recent_notes", [])),
             "Clientes asignados:\n" + serialize_rows(evidence.get("assigned_clients", [])),
             "Compromisos pendientes:\n" + serialize_rows(evidence.get("pending_tasks", [])),
+            "Compromisos de hoy:\n" + serialize_rows(evidence.get("today_pending", [])),
             "Prioridades sugeridas:\n" + serialize_rows(evidence.get("today_call_list", [])),
+            "Ranking sugerido:\n" + serialize_rows(evidence.get("ranked_accounts", [])),
+            f"Conteo entidad: {evidence.get('entity_count_summary')}",
+            f"Conteo owner: {evidence.get('owner_client_count')}",
+            f"KPIs owner: {evidence.get('owner_kpis')}",
+            f"KPIs globales: {evidence.get('global_kpis')}",
+            f"KPIs entidad: {evidence.get('entity_kpis')}",
             "Fragmentos de documentos:\n" + serialize_rows(evidence.get("document_chunks", [])),
         ]
         direct_answer = evidence.get("direct_answer")
         if direct_answer:
             prompt_parts.append(f"Respuesta directa sugerida por reglas: {direct_answer}")
+        prompt_parts.append(
+            "Regla final: responde la intencion real del usuario. Si la mejor respuesta es una sintesis comercial integrada, hazla. Si el usuario pidio una pieza lista para usar, entrégala completa."
+        )
         return "\n\n".join(prompt_parts)

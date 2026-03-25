@@ -125,6 +125,13 @@ class SalesAssistantServiceTests(unittest.TestCase):
         intent = classify_question("analiza mis notas y arma un plan para hoy")
         self.assertTrue(intent.asks_for_action_plan)
 
+    def test_analyze_my_notes_plan_keeps_owner_scope_not_random_entity(self) -> None:
+        response = self.service.answer_question("analiza mis notas y arma un plan para hoy", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("plan comercial de hoy para", answer)
+        self.assertIn("jesus emmanuel meza", answer)
+        self.assertNotIn("trujillo fletes", answer)
+
     def test_sales_material_query_should_be_detected(self) -> None:
         intent = classify_question("hazme argumentos de venta para una llamada con cafenio")
         self.assertTrue(intent.asks_for_sales_material)
@@ -180,6 +187,53 @@ class SalesAssistantServiceTests(unittest.TestCase):
         response = self.service.answer_question("si entro a una llamada en 5 minutos con movimex, que debo tener claro")
         answer = response.answer.lower()
         self.assertIn("movimex", answer)
+        self.assertNotIn("no encontre evidencia suficiente para responder", answer)
+
+    def test_status_query_for_entity_should_not_need_exact_phrase(self) -> None:
+        response = self.service.answer_question("Como vamos con JIBE?")
+        answer = response.answer.lower()
+        self.assertIn("jibe", answer)
+        self.assertNotIn("no encontre informacion registrada exactamente", answer)
+
+    def test_recent_activity_query_for_owner_uses_owner_scope(self) -> None:
+        response = self.service.answer_question("que actividad esta realizando Eduardo Valdez en CRM")
+        answer = response.answer.lower()
+        self.assertIn("eduardo valdez", answer)
+        self.assertNotIn("no encontre evidencia suficiente para responder", answer)
+
+    def test_geotab_leads_owner_alias_with_underscore_is_resolved(self) -> None:
+        response = self.service.answer_question("cuales son registros de clientes de geotab_leads")
+        answer = response.answer.lower()
+        self.assertIn("geotab", answer)
+        self.assertNotIn("no encontre clientes asignados", answer)
+
+    def test_geotab_owner_alias_without_underscore_is_resolved(self) -> None:
+        response = self.service.answer_question("cuales son registros de clientes de geotab")
+        answer = response.answer.lower()
+        self.assertIn("geotab", answer)
+        self.assertNotIn("no encontre clientes asignados", answer)
+
+    def test_free_minutes_work_plan_should_not_jump_to_random_account(self) -> None:
+        response = self.service.answer_question("tengo 30 min libres, hazme un plan de trabajo", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("plan comercial de hoy para", answer)
+        self.assertNotIn("salci", answer)
+
+    def test_owner_status_query_returns_owner_brief(self) -> None:
+        response = self.service.answer_question("como va Eliot Hernandez comercialmente")
+        answer = response.answer.lower()
+        self.assertIn("eliot hernandez", answer)
+        self.assertNotIn('no encontre informacion registrada exactamente para "como va eliot hernandez comercialmente"', answer)
+
+    def test_owner_pending_today_query_returns_today_pending(self) -> None:
+        response = self.service.answer_question("que pendientes tiene Ayuda consultoria hoy")
+        answer = response.answer.lower()
+        self.assertTrue("lo mas reciente visible" in answer or "pendiente" in answer or "compromisos de hoy" in answer)
+
+    def test_decision_maker_question_uses_entity_context(self) -> None:
+        response = self.service.answer_question("que decision maker ves en Condesa")
+        answer = response.answer.lower()
+        self.assertIn("condesa", answer)
         self.assertNotIn("no encontre evidencia suficiente para responder", answer)
 
 
