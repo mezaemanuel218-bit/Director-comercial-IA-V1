@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import sqlite3
 import unicodedata
@@ -81,7 +82,7 @@ class SalesAssistantService:
         self.client = OpenAI(api_key=api_key) if api_key else None
 
     def answer_question(self, question: str, user: AppUser | None = None) -> AssistantResponse:
-        subquestions = self._split_compound_question(question)
+        subquestions = self._semantic_split_question(question, user=user) or self._split_compound_question(question)
         if len(subquestions) > 1:
             subquestions = self._contextualize_subquestions(question, subquestions, user=user)
             subresponses = [self._answer_single_question(subquestion, user=user) for subquestion in subquestions]
@@ -269,6 +270,44 @@ class SalesAssistantService:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _semantic_split_question(self, question: str, user: AppUser | None = None) -> list[str]:
+        heuristic_parts = self._split_compound_question(question)
+        normalized = self._normalize_search_text(question)
+        looks_complex = (
+            len(question) >= 140
+            or len(heuristic_parts) > 1
+            or normalized.count("?") >= 1
+            or sum(normalized.count(token) for token in [" y ", " ademas ", " además ", " luego ", " despues ", " después "]) >= 2
+        )
+        if not self.client or not looks_complex:
+            return heuristic_parts
+        try:
+            user_context = self._user_context(user)
+            prompt = (
+                "Separa la consulta de un usuario comercial en tareas independientes y autosuficientes.\n"
+                "Devuelve SOLO JSON valido con la forma {\"topics\": [\"...\"]}.\n"
+                "Cada topic debe ser una solicitud completa en español, sin perder entidades, fechas, comparaciones ni formato pedido.\n"
+                "Si realmente es una sola solicitud, devuelve un solo topic.\n"
+                "No inventes temas nuevos.\n"
+                f"Usuario activo: {user_context}\n"
+                f"Consulta original: {question}"
+            )
+            response = self.client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            content = (response.choices[0].message.content or "").strip()
+            data = json.loads(content)
+            topics = [str(item).strip(" \n\t-") for item in data.get("topics", []) if str(item).strip()]
+            if not topics:
+                return heuristic_parts
+            if len(topics) == 1 and self._normalize_search_text(topics[0]) == self._normalize_search_text(question):
+                return heuristic_parts
+            return topics[:6]
+        except Exception:
+            return heuristic_parts
+
     def _split_compound_question(self, question: str) -> list[str]:
         normalized = self._normalize_search_text(question)
         if "analiza mis notas y arma un plan para hoy" in normalized:
@@ -300,6 +339,9 @@ class SalesAssistantService:
     ) -> str:
         if not subresponses:
             return "No encontre evidencia suficiente para responder."
+        semantic = self._semantic_combine_subresponses(question, subquestions, subresponses)
+        if semantic:
+            return semantic
         if len(subresponses) <= 2:
             merged: list[str] = []
             seen: set[str] = set()
@@ -319,6 +361,37 @@ class SalesAssistantService:
             lines.append(subresponse.answer.strip())
             lines.append("")
         return "\n".join(lines).strip()
+
+    def _semantic_combine_subresponses(
+        self,
+        question: str,
+        subquestions: list[str],
+        subresponses: list[AssistantResponse],
+    ) -> str | None:
+        if not self.client or len(subresponses) < 2:
+            return None
+        if all(not response.answer.strip() for response in subresponses):
+            return None
+        try:
+            joined = []
+            for subquestion, subresponse in zip(subquestions, subresponses):
+                joined.append(f"Subpregunta: {subquestion}\nRespuesta base: {subresponse.answer.strip()}")
+            prompt = (
+                "Integra las respuestas parciales en una sola respuesta final natural, fluida y sin sonar pegada.\n"
+                "No enumeres por subpregunta salvo que sea estrictamente necesario.\n"
+                "Conserva todos los datos concretos, pero organiza mejor el mensaje.\n"
+                "Si el usuario pidio algo accionable, deja una salida accionable. Si pidio una pieza lista, entrégala bien formada.\n"
+                f"Pregunta original: {question}\n\n"
+                + "\n\n".join(joined)
+            )
+            response = self.client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = (response.choices[0].message.content or "").strip()
+            return content or None
+        except Exception:
+            return None
 
     def _contextualize_subquestions(self, original_question: str, subquestions: list[str], user: AppUser | None = None) -> list[str]:
         carried_entity = self._extract_entity_hint(original_question)
@@ -457,7 +530,7 @@ class SalesAssistantService:
         if desired_format in {"email", "message", "plan", "executive", "conclusion_evidence"}:
             depth = "deep"
 
-        return TaskInterpretation(
+        task = TaskInterpretation(
             task_type=task_type,
             desired_format=desired_format,
             response_style=response_style,
@@ -468,6 +541,66 @@ class SalesAssistantService:
             asks_for_summary=asks_for_summary,
             asks_for_action=asks_for_action,
         )
+        return self._semantic_task_override(question, evidence, task)
+
+    def _semantic_task_override(
+        self,
+        question: str,
+        evidence: dict[str, Any],
+        task: TaskInterpretation,
+    ) -> TaskInterpretation:
+        if not self.client:
+            return task
+        normalized = self._normalize_search_text(question)
+        looks_ambiguous = (
+            len(question) >= 100
+            or any(token in normalized for token in ["cual es el mejor", "cual es la mejor", "mas valor", "principal", "prioridad", "resume y", "luego ", "ademas ", "además "])
+        )
+        if not looks_ambiguous:
+            return task
+        try:
+            prompt = (
+                "Interpreta la tarea comercial real del usuario y devuelve SOLO JSON valido.\n"
+                "Usa esta forma exacta: "
+                "{\"task_type\":\"lookup|summarize|recommend|compare|create|metrics\","
+                "\"desired_format\":\"default|email|message|bullets|plan|executive|conclusion_evidence\","
+                "\"depth\":\"standard|deep\","
+                "\"response_style\":\"concise_data|commercial_advisor\","
+                "\"asks_for_action\":true,"
+                "\"asks_for_summary\":false,"
+                "\"asks_for_comparison\":false,"
+                "\"asks_for_creation\":false,"
+                "\"asks_for_recommendation\":true}.\n"
+                "Si el usuario pide ranking, priorizacion, mejor prospecto, principal cuenta o a quien contactar, usa recommend.\n"
+                "Si pide crear correo, whatsapp, propuesta o texto listo, usa create.\n"
+                "Si pide resumen o como vamos con una cuenta, usa summarize.\n"
+                "No inventes entidades ni datos.\n"
+                f"Pregunta: {question}\n"
+                f"Entidad detectada: {evidence.get('entity_hint')}\n"
+                f"Owner aplicado: {evidence.get('owner_scope')}\n"
+                f"Resumen cliente: {evidence.get('entity_brief')}\n"
+                f"Resumen vendedor: {evidence.get('owner_brief')}"
+            )
+            response = self.client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            content = (response.choices[0].message.content or "").strip()
+            data = json.loads(content)
+            return TaskInterpretation(
+                task_type=data.get("task_type") or task.task_type,
+                desired_format=data.get("desired_format") or task.desired_format,
+                response_style=data.get("response_style") or task.response_style,
+                depth=data.get("depth") or task.depth,
+                asks_for_recommendation=bool(data.get("asks_for_recommendation", task.asks_for_recommendation)),
+                asks_for_creation=bool(data.get("asks_for_creation", task.asks_for_creation)),
+                asks_for_comparison=bool(data.get("asks_for_comparison", task.asks_for_comparison)),
+                asks_for_summary=bool(data.get("asks_for_summary", task.asks_for_summary)),
+                asks_for_action=bool(data.get("asks_for_action", task.asks_for_action)),
+            )
+        except Exception:
+            return task
 
     def _build_evidence_pack(
         self,
