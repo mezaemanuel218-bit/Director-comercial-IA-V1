@@ -549,6 +549,21 @@ class SalesAssistantService:
         return evidence.get("direct_answer") or self._format_evidence_fallback(evidence)
 
     def _should_prefer_direct_answer(self, intent: QuestionIntent, evidence: dict[str, Any], task: TaskInterpretation) -> bool:
+        gpt_sensitive_structured_keys = [
+            "owner_comparison",
+            "owner_brief",
+            "team_brief",
+            "action_plan",
+            "entity_brief",
+            "sales_draft",
+            "sales_material",
+            "today_call_list",
+            "comparison_candidates",
+            "ranked_accounts",
+            "risk_profile",
+        ]
+        if any(evidence.get(key) for key in gpt_sensitive_structured_keys):
+            return True
         if task.task_type in {"create", "recommend", "summarize", "compare"}:
             return False
         if task.desired_format != "default":

@@ -236,6 +236,16 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("condesa", answer)
         self.assertNotIn("no encontre evidencia suficiente para responder", answer)
 
+    def test_structured_owner_comparison_prefers_direct_answer_path(self) -> None:
+        intent = classify_question("diferencias entre emmanuel y pablo melin")
+        self.assertTrue(
+            self.service._should_prefer_direct_answer(
+                intent,
+                {"owner_comparison": [{"owner_name": "Jesus Emmanuel Meza Guzmán"}]},
+                self.service._interpret_task("diferencias entre emmanuel y pablo melin", intent, {}),
+            )
+        )
+
 
 class HistoryIsolationTests(unittest.TestCase):
     def test_history_can_be_filtered_by_username(self) -> None:
