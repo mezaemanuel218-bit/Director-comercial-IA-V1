@@ -1,4 +1,5 @@
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 
 from assistant_core.auth import AppUser, authenticate_user, get_user, session_secret_key
-from assistant_core.config import PROJECT_ROOT
+from assistant_core.config import BOOTSTRAP_WAREHOUSE_DB, PROJECT_ROOT, WAREHOUSE_DB
 from assistant_core.documents import index_documents, indexed_documents_count
 from assistant_core.history import ensure_history_schema, fetch_history, save_history
 from assistant_core.reporting import available_owners, dashboard_metrics
@@ -70,6 +71,11 @@ def prepare_local_state() -> None:
     ensure_history_schema()
     ensure_runtime_schema()
     counts = warehouse_counts()
+    if not any(counts.get(table, 0) for table in ("leads", "contacts", "notes", "calls", "tasks", "events", "interactions")):
+        if BOOTSTRAP_WAREHOUSE_DB.exists():
+            WAREHOUSE_DB.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(BOOTSTRAP_WAREHOUSE_DB, WAREHOUSE_DB)
+            counts = warehouse_counts()
     if not any(counts.get(table, 0) for table in ("leads", "contacts", "notes", "calls", "tasks", "events", "interactions")):
         build_warehouse()
         counts = warehouse_counts()

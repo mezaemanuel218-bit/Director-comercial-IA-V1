@@ -9,6 +9,7 @@ ResponseMode = Literal["data", "analysis", "hybrid"]
 def _normalize(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text or "")
     ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+    ascii_text = ascii_text.replace("_", " ")
     return " ".join(ascii_text.lower().split())
 
 
@@ -171,6 +172,7 @@ def classify_question(question: str) -> QuestionIntent:
             "dame contexto de",
             "dame contexto comercial de",
             "que sabes de",
+            "como vamos con",
             "que sigue con",
             "siguiente paso de",
             "objeciones de",
@@ -246,8 +248,11 @@ def classify_question(question: str) -> QuestionIntent:
 
     asks_for_interactions_by_owner = "interacciones" in q and any(token in q for token in ["vendedor", "agente", "propietario", "cada"])
     asks_for_generic_relative_interactions = any(token in q for token in ["interacciones", "actividad"]) and any(token in q for token in ["ayer", "antier", "anteayer"])
-    asks_for_recent_activity_by_owner = any(token in q for token in ["actividad reciente", "mas actividad reciente"]) and any(token in q for token in ["quien", "vendedor", "de "])
-    asks_for_risks = any(token in q for token in ["riesgo", "riesgos", "objecion", "objeciones", "bloqueador", "bloqueadores"])
+    asks_for_recent_activity_by_owner = (
+        (any(token in q for token in ["actividad reciente", "mas actividad reciente"]) and any(token in q for token in ["quien", "vendedor", "de "]))
+        or ("que actividad esta realizando" in q and any(token in q for token in ["crm", "vendedor", "eduardo", "pablo", "emmanuel"]))
+    )
+    asks_for_risks = any(token in q for token in ["riesgo", "riesgos", "objecion", "objeciones", "bloqueador", "bloqueadores", "decision maker", "vale la pena seguir insistiendo"])
     asks_for_kpis = "kpi" in q or "kpis" in q or ("metric" in q and any(token in q for token in ["nota", "cliente"]))
     asks_for_global_kpis = asks_for_kpis and any(token in q for token in ["global", "todos", "vendedores", "equipo"])
     asks_for_weekly_window = "semana" in q
@@ -269,7 +274,7 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_yesterday_contacts = "ayer" in q and any(token in q for token in ["hable", "llame", "contacte"])
     asks_for_day_before_yesterday_contacts = any(token in q for token in ["antier", "anteayer"]) and any(token in q for token in ["hable", "llame", "contacte"])
     asks_for_latest_contacted = any(token in q for token in ["ultimo cliente", "cliente que se contacto a lo ultimo"])
-    asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "compromiso", "tarea"])
+    asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "pendientes", "compromiso", "compromisos", "tarea", "tareas"])
     asks_for_latest_note = any(token in q for token in ["ultima nota", "última nota", "nota agregada", "nota mas reciente", "nota más reciente"])
 
     analysis_signals = [

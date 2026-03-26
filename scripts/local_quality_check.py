@@ -96,12 +96,31 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
     ]
     questions.extend(base_self_questions)
 
+    strategic_self_questions = [
+        {"username": "emeza", "question": "tengo 30 min libres, hazme un plan de trabajo"},
+        {"username": "emeza", "question": "tengo 60 min libres, hazme un plan de trabajo"},
+        {"username": "emeza", "question": "si hoy solo cierro una accion comercial, cual deberia ser"},
+        {"username": "emeza", "question": "que tres clientes debo atacar primero esta semana"},
+        {"username": "emeza", "question": "que clientes estan mas cerca de cerrar"},
+        {"username": "emeza", "question": "que clientes corren riesgo de perderse"},
+        {"username": "emeza", "question": "hazme un plan de rescate para mis clientes frios"},
+        {"username": "emeza", "question": "dame primero conclusion y luego evidencia sobre mi cartera"},
+        {"username": "emeza", "question": "que clientes de mi cartera tienen mas señal de compra"},
+        {"username": "emeza", "question": "que clientes de mi cartera tienen mas objeciones"},
+    ]
+    questions.extend(strategic_self_questions)
+
     for owner in owners:
         questions.extend(
             [
                 {"username": "evaldez", "question": f"kpi {owner} de la semana"},
                 {"username": "evaldez", "question": f"quienes son los clientes de {owner}"},
+                {"username": "evaldez", "question": f"cuales son registros de clientes de {owner}"},
                 {"username": "evaldez", "question": f"actividad reciente de {owner}"},
+                {"username": "evaldez", "question": f"que actividad esta realizando {owner} en CRM"},
+                {"username": "evaldez", "question": f"como va {owner} comercialmente"},
+                {"username": "evaldez", "question": f"los mejores tres clientes de {owner} y por que"},
+                {"username": "evaldez", "question": f"que pendientes tiene {owner} hoy"},
                 {"username": "evaldez", "question": f"diferencias entre {owner} y Eduardo Valdez"},
             ]
         )
@@ -115,8 +134,13 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
                 {"username": "emeza", "question": f"cuales son los nombres de contactos, numeros de telefono y correos de {entity}"},
                 {"username": "emeza", "question": f"que objeciones hay en {entity}"},
                 {"username": "emeza", "question": f"que sigue con {entity}"},
+                {"username": "emeza", "question": f"como vamos con {entity}"},
                 {"username": "emeza", "question": f"ultimo contacto de {entity}"},
+                {"username": "emeza", "question": f"cuando fue la ultima interaccion con {entity}"},
+                {"username": "emeza", "question": f"cuantos clientes o prospectos estan registrados con {entity}"},
+                {"username": "emeza", "question": f"que notas hay de {entity}"},
                 {"username": "emeza", "question": f"redactame un correo para {entity} buscando cerrar una demo"},
+                {"username": "emeza", "question": f"dame asunto y cuerpo de correo para {entity}"},
                 {"username": "emeza", "question": f"hazme argumentos de venta para una llamada con {entity}"},
                 {"username": "emeza", "question": f"que harias hoy, manana y esta semana con {entity}"},
                 {"username": "emeza", "question": f"dame resumen de {entity} y luego redactame un correo"},
@@ -124,6 +148,16 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
                 {"username": "emeza", "question": f"resumeme {entity} en contexto, riesgo y siguiente paso"},
                 {"username": "emeza", "question": f"si entro a una llamada en 5 minutos con {entity}, que debo tener claro"},
                 {"username": "emeza", "question": f"dame objeciones probables y como responderlas para {entity}"},
+                {"username": "emeza", "question": f"hazme una propuesta comercial breve para {entity}"},
+                {"username": "emeza", "question": f"armame bullets de valor para presentar flotimatics a {entity}"},
+                {"username": "emeza", "question": f"redacta un correo amable para {entity} si no responde desde hace semanas"},
+                {"username": "emeza", "question": f"redacta un correo agresivo de seguimiento para {entity}"},
+                {"username": "emeza", "question": f"preparame una mini agenda de reunion para {entity}"},
+                {"username": "emeza", "question": f"que decision maker ves en {entity}"},
+                {"username": "emeza", "question": f"esto huele a venta o no en {entity}"},
+                {"username": "emeza", "question": f"vale la pena seguir insistiendo con {entity}"},
+                {"username": "emeza", "question": f"que me falta para mover a {entity} a la siguiente etapa"},
+                {"username": "emeza", "question": f"quiero una respuesta comercial, no solo una lista de datos, sobre {entity}"},
             ]
         )
 
@@ -132,28 +166,47 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
             [
                 {"username": "emeza", "question": f"compara {first} vs {second}"},
                 {"username": "emeza", "question": f"cual va mas avanzado entre {first} y {second}"},
+                {"username": "emeza", "question": f"entre {first} y {second}, cual atacarias primero y por que"},
+                {"username": "emeza", "question": f"compara {first} y {second} en oportunidad comercial"},
+                {"username": "emeza", "question": f"resume {first}, detecta riesgo y redacta seguimiento para {second}"},
             ]
         )
 
-    while len(questions) < 110:
-        entity = entities[len(questions) % len(entities)]
+    typo_cases = [
+        {"username": "emeza", "question": "jibo"},
+        {"username": "emeza", "question": "movimx"},
+        {"username": "emeza", "question": "cafnio"},
+        {"username": "emeza", "question": "que notas hay de jibo? cuantos clientes o prospectos estan registrados a ese nombre?"},
+        {"username": "emeza", "question": "que me dices de jibo? que plan de accion me recomiendas para el?"},
+    ]
+    questions.extend(typo_cases)
+
+    formatting_questions = [
+        {"username": "emeza", "question": "dame la respuesta como correo sobre mi mejor oportunidad"},
+        {"username": "emeza", "question": "dame la respuesta como whatsapp sobre mi cliente mas caliente"},
+        {"username": "emeza", "question": "dame la respuesta como plan de accion sobre mi cartera"},
+        {"username": "emeza", "question": "dame solo recomendacion y riesgos de mi cartera"},
+        {"username": "emeza", "question": "dame primero conclusion y luego evidencia sobre mi cartera"},
+    ]
+    questions.extend(formatting_questions)
+
+    while len(questions) < 420:
+        entity = entities[len(questions) % max(1, len(entities))]
+        owner = owners[len(questions) % max(1, len(owners))]
         questions.append(
             {
                 "username": "emeza",
-                "question": f"hazme un resumen ejecutivo de {entity}",
+                "question": [
+                    f"hazme un resumen ejecutivo de {entity}",
+                    f"como ves a {entity}",
+                    f"que sigue con {entity}",
+                    f"que objeciones ves en {entity}",
+                    f"que actividad esta realizando {owner} en CRM",
+                    f"que clientes tiene {owner}",
+                ][len(questions) % 6],
             }
         )
-    questions.extend(
-        [
-            {"username": "emeza", "question": "jibo"},
-            {"username": "emeza", "question": "que notas hay de jibo? cuantos clientes o prospectos estan registrados a ese nombre?"},
-            {"username": "emeza", "question": "que me dices de jibo? que plan de accion me recomiendas para el?"},
-            {"username": "emeza", "question": "los mejores tres clientes de Eduardo y por que"},
-            {"username": "emeza", "question": "cuantos clientes tengo registrados o dados de alta?"},
-            {"username": "emeza", "question": "cuantos clientes o prospectos estan registrados con jibe?"},
-        ]
-    )
-    return questions[:140]
+    return questions[:420]
 
 
 def evaluate_questions(db_path: Path, output_dir: Path) -> Path:
