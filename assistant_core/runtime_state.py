@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from assistant_core.config import WAREHOUSE_DB
@@ -37,7 +37,7 @@ def set_runtime_value(key: str, value: str) -> None:
             value=excluded.value,
             updated_at=excluded.updated_at
         """,
-        (key, value, datetime.now().isoformat()),
+        (key, value, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()

@@ -17,6 +17,8 @@ const sourcePill = document.getElementById("sourcePill");
 const webPill = document.getElementById("webPill");
 const feedbackBanner = document.getElementById("feedbackBanner");
 const refreshOutput = document.getElementById("refreshOutput");
+const syncStatusBadge = document.getElementById("syncStatusBadge");
+const syncTimer = document.getElementById("syncTimer");
 const ownerFilter = document.getElementById("ownerFilter");
 const dateFromFilter = document.getElementById("dateFromFilter");
 const dateToFilter = document.getElementById("dateToFilter");
@@ -34,6 +36,8 @@ const recentActivityList = document.getElementById("recentActivityList");
 const historyList = document.getElementById("historyList");
 const prioritiesTable = document.getElementById("prioritiesTable");
 let refreshCooldownTimer = null;
+let refreshStatusPollTimer = null;
+let syncElapsedTimer = null;
 
 function formatCooldown(seconds) {
   if (!seconds || seconds <= 0) return "";
@@ -67,6 +71,100 @@ function applyRefreshCooldown(seconds) {
     }
     refreshButton.textContent = `Disponible en ${formatCooldown(remaining)}`;
   }, 1000);
+}
+
+function applySyncState(syncInProgress, requestedBy, cooldownSeconds) {
+  if (syncInProgress) {
+    refreshButton.disabled = true;
+    const byLabel = requestedBy ? ` (${requestedBy})` : "";
+    refreshButton.textContent = `Actualizando${byLabel}`;
+    return;
+  }
+  applyRefreshCooldown(cooldownSeconds || 0);
+}
+
+function formatElapsedSince(isoString) {
+  if (!isoString) return "";
+  const startedAt = new Date(isoString);
+  if (Number.isNaN(startedAt.getTime())) return "";
+  const diffSeconds = Math.max(0, Math.floor((Date.now() - startedAt.getTime()) / 1000));
+  const minutes = Math.floor(diffSeconds / 60);
+  const seconds = diffSeconds % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  if (minutes < 60) return `${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function stopSyncElapsedTimer() {
+  if (syncElapsedTimer) {
+    clearInterval(syncElapsedTimer);
+    syncElapsedTimer = null;
+  }
+}
+
+function setSyncIndicator(state, message, startedAt) {
+  syncStatusBadge.className = `sync-badge ${state}`;
+  const labels = {
+    idle: "En espera",
+    running: "Actualizando",
+    ok: "Actualizado",
+    snapshot: "Snapshot activo",
+    error: "Error de sync",
+  };
+  syncStatusBadge.textContent = labels[state] || "Estado";
+  syncTimer.textContent = message || "Sin actividad reciente.";
+  stopSyncElapsedTimer();
+  if (state === "running" && startedAt) {
+    const refreshTimerText = () => {
+      const elapsed = formatElapsedSince(startedAt);
+      syncTimer.textContent = elapsed ? `Tiempo corriendo: ${elapsed}` : "Actualizando Zoho en segundo plano...";
+    };
+    refreshTimerText();
+    syncElapsedTimer = setInterval(refreshTimerText, 1000);
+  }
+}
+
+function updateSyncIndicatorFromData(data) {
+  if (data.sync_in_progress) {
+    const byLabel = data.sync_requested_by ? ` por ${data.sync_requested_by}` : "";
+    setSyncIndicator("running", `Actualizando${byLabel}...`, data.sync_started_at);
+    return;
+  }
+  if (data.refresh_mode === "error") {
+    setSyncIndicator("error", "La ultima sincronizacion fallo. Se mantiene lo ultimo disponible.");
+    return;
+  }
+  if (data.refresh_mode === "snapshot_only" || data.refresh_mode === "startup_snapshot") {
+    const updated = data.last_refresh ? `Ultima referencia: ${data.last_refresh}` : "Sincronizacion pendiente.";
+    setSyncIndicator("snapshot", updated);
+    return;
+  }
+  if (data.last_refresh) {
+    setSyncIndicator("ok", `Ultima actualizacion: ${data.last_refresh}`);
+    return;
+  }
+  setSyncIndicator("idle", "Sin actividad reciente.");
+}
+
+function scheduleRefreshStatusPolling() {
+  if (refreshStatusPollTimer) {
+    clearInterval(refreshStatusPollTimer);
+  }
+  refreshStatusPollTimer = setInterval(async () => {
+    try {
+      await loadDashboard();
+    } catch (error) {
+      console.error(error);
+    }
+  }, 15000);
+}
+
+function stopRefreshStatusPolling() {
+  if (refreshStatusPollTimer) {
+    clearInterval(refreshStatusPollTimer);
+    refreshStatusPollTimer = null;
+  }
 }
 
 async function readJsonSafely(response) {
@@ -217,8 +315,8 @@ async function askQuestion() {
 async function refreshData() {
   clearBanner();
   refreshButton.disabled = true;
-  refreshButton.textContent = "Actualizando...";
-  refreshOutput.textContent = "Sincronizando Zoho, reconstruyendo warehouse e indexando PDFs...";
+  refreshButton.textContent = "Solicitando actualizacion...";
+  refreshOutput.textContent = "Solicitando sincronizacion de Zoho en segundo plano...";
 
   try {
     const response = await fetch("/refresh", {
@@ -233,14 +331,19 @@ async function refreshData() {
     }
 
     refreshOutput.innerHTML = `
+      <strong>Estado:</strong> ${data.status || "ok"}<br>
       <strong>Modulos sincronizados:</strong> ${data.synced_modules.join(", ")}<br>
       <strong>Warehouse:</strong> leads ${data.warehouse.leads}, contacts ${data.warehouse.contacts}, notes ${data.warehouse.notes}, calls ${data.warehouse.calls}, tasks ${data.warehouse.tasks}, events ${data.warehouse.events}, interactions ${data.warehouse.interactions}<br>
       <strong>Documentos indexados:</strong> ${data.indexed_documents}<br>
       <strong>Ultima actualizacion:</strong> ${data.last_refresh || "sin dato"}<br>
-      <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.cooldown_seconds ? `<br><strong>Proxima sincronizacion manual:</strong> ${formatCooldown(data.cooldown_seconds)}` : ""}
+      <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.sync_in_progress ? `<br><strong>Sync en curso:</strong> ${data.sync_requested_by || "si"}` : ""}${data.cooldown_seconds ? `<br><strong>Proxima sincronizacion manual:</strong> ${formatCooldown(data.cooldown_seconds)}` : ""}
     `;
-    setBanner(data.warning || "Actualizacion completada correctamente.");
-    applyRefreshCooldown(data.cooldown_seconds || 0);
+    setBanner(data.warning || (data.status === "queued" ? "Sincronizacion iniciada correctamente." : "Estado actualizado."));
+    applySyncState(data.sync_in_progress, data.sync_requested_by, data.cooldown_seconds || 0);
+    updateSyncIndicatorFromData(data);
+    if (data.sync_in_progress || data.status === "queued" || data.status === "running") {
+      scheduleRefreshStatusPolling();
+    }
     await Promise.all([loadDashboard(), loadOwners()]);
   } catch (error) {
     refreshOutput.textContent = "La actualizacion no se completo.";
@@ -372,10 +475,16 @@ async function loadDashboard() {
     if (data.last_refresh) {
       refreshOutput.innerHTML = `
         <strong>Ultima actualizacion conocida:</strong> ${data.last_refresh}<br>
-        <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.cooldown_seconds ? `<br><strong>Proxima sincronizacion manual:</strong> ${formatCooldown(data.cooldown_seconds)}` : ""}${data.warning ? `<br><strong>Estado:</strong> ${data.warning}` : ""}
+        <strong>Modo:</strong> ${data.refresh_mode || "ok"}${data.sync_in_progress ? `<br><strong>Sync en curso:</strong> ${data.sync_requested_by || "si"}` : ""}${data.cooldown_seconds ? `<br><strong>Proxima sincronizacion manual:</strong> ${formatCooldown(data.cooldown_seconds)}` : ""}${data.warning ? `<br><strong>Estado:</strong> ${data.warning}` : ""}
       `;
     }
-    applyRefreshCooldown(data.cooldown_seconds || 0);
+    applySyncState(data.sync_in_progress, data.sync_requested_by, data.cooldown_seconds || 0);
+    updateSyncIndicatorFromData(data);
+    if (data.sync_in_progress) {
+      scheduleRefreshStatusPolling();
+    } else {
+      stopRefreshStatusPolling();
+    }
   } catch (error) {
     console.error(error);
   }

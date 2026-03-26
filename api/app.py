@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +18,14 @@ from assistant_core.history import ensure_history_schema, fetch_history, save_hi
 from assistant_core.reporting import available_owners, dashboard_metrics
 from assistant_core.runtime_state import ensure_runtime_schema, get_runtime_value, set_runtime_value
 from assistant_core.service import SalesAssistantService
+from assistant_core.sync_runtime import (
+    acquire_sync_lock,
+    get_sync_snapshot,
+    mark_sync_failure,
+    mark_sync_success,
+    refresh_is_stale,
+    release_sync_lock,
+)
 from assistant_core.warehouse import build_warehouse, warehouse_counts
 from scripts.sync_zoho import run as sync_zoho
 
@@ -48,6 +58,12 @@ app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 ensure_history_schema()
 ensure_runtime_schema()
 ZOHO_REFRESH_COOLDOWN_MINUTES = 10
+AUTO_REFRESH_MAX_AGE_MINUTES = int(os.getenv("AUTO_REFRESH_MAX_AGE_MINUTES", "60"))
+AUTO_REFRESH_LOOP_SECONDS = int(os.getenv("AUTO_REFRESH_LOOP_SECONDS", "300"))
+AUTO_REFRESH_ENABLED = os.getenv("AUTO_REFRESH_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+INTERNAL_REFRESH_TOKEN = os.getenv("INTERNAL_REFRESH_TOKEN", "").strip()
+_SYNC_THREAD_GUARD = threading.Lock()
+_SYNC_LOOP_STARTED = False
 
 
 def prepare_local_state() -> None:
@@ -78,7 +94,7 @@ def _parse_runtime_timestamp(value: str | None) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value)
         if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
+            return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo).astimezone(timezone.utc)
         return parsed.astimezone(timezone.utc)
     except ValueError:
         return None
@@ -95,6 +111,94 @@ def _refresh_cooldown_remaining_seconds() -> int:
     cooldown = timedelta(minutes=ZOHO_REFRESH_COOLDOWN_MINUTES)
     remaining = cooldown - elapsed
     return max(0, int(remaining.total_seconds()))
+
+
+def _sync_modules() -> list[str]:
+    return ["leads", "contacts", "notes", "calls", "tasks", "events"]
+
+
+def _run_sync_pipeline(requested_by: str) -> None:
+    if not acquire_sync_lock(requested_by):
+        return
+    try:
+        set_runtime_value("last_refresh_attempt", requested_by)
+        sync_zoho()
+        build_warehouse()
+        index_documents()
+        mark_sync_success(requested_by)
+    except Exception as exc:
+        counts = warehouse_counts()
+        if counts.get("leads", 0) > 0 or counts.get("contacts", 0) > 0:
+            mark_sync_failure(str(exc), fallback_mode="snapshot_only")
+        else:
+            mark_sync_failure(str(exc), fallback_mode="error")
+    finally:
+        release_sync_lock()
+
+
+def _start_sync_thread(requested_by: str) -> bool:
+    with _SYNC_THREAD_GUARD:
+        snapshot = get_sync_snapshot()
+        if snapshot.sync_in_progress:
+            return False
+        thread = threading.Thread(target=_run_sync_pipeline, args=(requested_by,), daemon=True)
+        thread.start()
+        return True
+
+
+def _sync_warning() -> str | None:
+    snapshot = get_sync_snapshot()
+    if snapshot.sync_in_progress:
+        requester = snapshot.sync_requested_by or "otro proceso"
+        return f"Hay una sincronizacion de Zoho en curso ({requester}). Se mantiene el ultimo snapshot disponible."
+    if snapshot.refresh_mode == "snapshot_only":
+        warning = "Usando snapshot local. La sincronizacion en vivo con Zoho no esta disponible en este momento."
+        if snapshot.refresh_error:
+            warning += f" Error: {snapshot.refresh_error}"
+        return warning
+    if snapshot.refresh_mode == "error" and snapshot.refresh_error:
+        return f"La ultima sincronizacion fallo: {snapshot.refresh_error}"
+    return None
+
+
+def _build_refresh_response(status: str = "ok", warning: str | None = None) -> "RefreshResponse":
+    counts = warehouse_counts()
+    snapshot = get_sync_snapshot()
+    return RefreshResponse(
+        status=status,
+        synced_modules=_sync_modules(),
+        warehouse=counts,
+        indexed_documents=indexed_documents_count(),
+        last_refresh=snapshot.last_refresh,
+        refresh_mode=snapshot.refresh_mode,
+        warning=warning or _sync_warning(),
+        cooldown_seconds=_refresh_cooldown_remaining_seconds(),
+        sync_in_progress=snapshot.sync_in_progress,
+        sync_requested_by=snapshot.sync_requested_by,
+        sync_started_at=snapshot.sync_started_at,
+    )
+
+
+def _ensure_sync_loop() -> None:
+    global _SYNC_LOOP_STARTED
+    if _SYNC_LOOP_STARTED or not AUTO_REFRESH_ENABLED:
+        return
+
+    def loop() -> None:
+        while True:
+            try:
+                if refresh_is_stale(AUTO_REFRESH_MAX_AGE_MINUTES):
+                    _start_sync_thread("auto_scheduler")
+            except Exception:
+                pass
+            time.sleep(max(60, AUTO_REFRESH_LOOP_SECONDS))
+
+    with _SYNC_THREAD_GUARD:
+        if _SYNC_LOOP_STARTED:
+            return
+        thread = threading.Thread(target=loop, daemon=True)
+        thread.start()
+        _SYNC_LOOP_STARTED = True
 
 
 class AskRequest(BaseModel):
@@ -127,6 +231,9 @@ class RefreshResponse(BaseModel):
     refresh_mode: str | None = None
     warning: str | None = None
     cooldown_seconds: int = 0
+    sync_in_progress: bool = False
+    sync_requested_by: str | None = None
+    sync_started_at: str | None = None
 
 
 class HistoryItem(BaseModel):
@@ -152,6 +259,9 @@ class DashboardResponse(BaseModel):
     refresh_mode: str | None = None
     warning: str | None = None
     cooldown_seconds: int = 0
+    sync_in_progress: bool = False
+    sync_requested_by: str | None = None
+    sync_started_at: str | None = None
 
 
 class PriorityResponse(BaseModel):
@@ -193,6 +303,9 @@ def home() -> FileResponse:
 @app.on_event("startup")
 def startup_event() -> None:
     prepare_local_state()
+    _ensure_sync_loop()
+    if AUTO_REFRESH_ENABLED and refresh_is_stale(AUTO_REFRESH_MAX_AGE_MINUTES):
+        _start_sync_thread("startup_auto")
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -245,74 +358,42 @@ def ask(payload: AskRequest, user: AppUser = Depends(require_user)) -> AskRespon
 
 @app.post("/refresh", response_model=RefreshResponse)
 def refresh(user: AppUser = Depends(require_user)) -> RefreshResponse:
+    snapshot = get_sync_snapshot()
+    if snapshot.sync_in_progress:
+        return _build_refresh_response(status="running")
     cooldown_seconds = _refresh_cooldown_remaining_seconds()
     if cooldown_seconds > 0:
-        counts = warehouse_counts()
-        last_refresh = get_runtime_value("last_refresh")
-        refresh_status = get_runtime_value("last_refresh_status")
-        return RefreshResponse(
-            status="ok",
-            synced_modules=["leads", "contacts", "notes", "calls", "tasks", "events"],
-            warehouse=counts,
-            indexed_documents=0,
-            last_refresh=last_refresh["updated_at"] if last_refresh else None,
-            refresh_mode=refresh_status["value"] if refresh_status else "snapshot_only",
-            warning=(
-                f"Para evitar saturar Zoho, la siguiente sincronizacion manual estara disponible "
-                f"en aproximadamente {cooldown_seconds // 60 + (1 if cooldown_seconds % 60 else 0)} minuto(s). "
-                "Mientras tanto se usa el ultimo snapshot cargado."
-            ),
-            cooldown_seconds=cooldown_seconds,
+        warning = (
+            f"Para evitar saturar Zoho, la siguiente sincronizacion manual estara disponible "
+            f"en aproximadamente {cooldown_seconds // 60 + (1 if cooldown_seconds % 60 else 0)} minuto(s). "
+            "Mientras tanto se usa el ultimo snapshot cargado."
         )
+        return _build_refresh_response(status="cooldown", warning=warning)
 
-    warning = None
-    try:
-        set_runtime_value("last_refresh_attempt", "manual_attempt")
-        sync_zoho()
-        stats = build_warehouse()
-        indexed_documents = index_documents()
-        set_runtime_value("last_refresh", "manual_refresh")
-        set_runtime_value("last_refresh_status", "ok")
-        set_runtime_value("last_refresh_error", "")
-        last_refresh = get_runtime_value("last_refresh")
-        refresh_status = get_runtime_value("last_refresh_status")
-    except Exception as exc:
-        counts = warehouse_counts()
-        if counts.get("leads", 0) > 0 or counts.get("contacts", 0) > 0:
-            set_runtime_value("last_refresh_status", "snapshot_only")
-            set_runtime_value("last_refresh_error", str(exc))
-            last_refresh = get_runtime_value("last_refresh")
-            refresh_status = get_runtime_value("last_refresh_status")
-            warning = "No se pudo sincronizar Zoho en vivo. Se mantiene la informacion del ultimo snapshot cargado."
-        return RefreshResponse(
-            status="ok",
-            synced_modules=["leads", "contacts", "notes", "calls", "tasks", "events"],
-            warehouse=counts,
-            indexed_documents=0,
-            last_refresh=last_refresh["updated_at"] if last_refresh else None,
-            refresh_mode=refresh_status["value"] if refresh_status else "snapshot_only",
-            warning=warning,
-            cooldown_seconds=ZOHO_REFRESH_COOLDOWN_MINUTES * 60,
-        )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    started = _start_sync_thread(f"manual:{user.username}")
+    if not started:
+        return _build_refresh_response(status="running")
+    return _build_refresh_response(
+        status="queued",
+        warning="Sincronizacion de Zoho iniciada en segundo plano. Puedes seguir usando la app mientras termina.",
+    )
 
-    return RefreshResponse(
-        status="ok",
-        synced_modules=["leads", "contacts", "notes", "calls", "tasks", "events"],
-        warehouse={
-            "leads": stats.leads,
-            "contacts": stats.contacts,
-            "notes": stats.notes,
-            "calls": stats.calls,
-            "tasks": stats.tasks,
-            "events": stats.events,
-            "interactions": stats.interactions,
-        },
-        indexed_documents=indexed_documents,
-        last_refresh=last_refresh["updated_at"] if last_refresh else None,
-        refresh_mode=refresh_status["value"] if refresh_status else "ok",
-        warning=warning,
-        cooldown_seconds=ZOHO_REFRESH_COOLDOWN_MINUTES * 60,
+
+@app.post("/internal/refresh", response_model=RefreshResponse)
+def internal_refresh(request: Request) -> RefreshResponse:
+    if not INTERNAL_REFRESH_TOKEN:
+        raise HTTPException(status_code=404, detail="No disponible.")
+    if request.headers.get("x-refresh-token", "").strip() != INTERNAL_REFRESH_TOKEN:
+        raise HTTPException(status_code=401, detail="Token invalido.")
+    snapshot = get_sync_snapshot()
+    if snapshot.sync_in_progress:
+        return _build_refresh_response(status="running")
+    started = _start_sync_thread("internal_auto")
+    if not started:
+        return _build_refresh_response(status="running")
+    return _build_refresh_response(
+        status="queued",
+        warning="Sincronizacion interna iniciada en segundo plano.",
     )
 
 
@@ -335,23 +416,19 @@ def dashboard(
 ) -> DashboardResponse:
     try:
         data = dashboard_metrics(owner=owner, date_from=date_from, date_to=date_to, status=status)
-        last_refresh = get_runtime_value("last_refresh")
-        refresh_status = get_runtime_value("last_refresh_status")
-        refresh_error = get_runtime_value("last_refresh_error")
         cooldown_seconds = _refresh_cooldown_remaining_seconds()
+        snapshot = get_sync_snapshot()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    warning = None
-    if refresh_status and refresh_status["value"] == "snapshot_only":
-        warning = "Usando snapshot local. La sincronizacion en vivo con Zoho no esta disponible en este momento."
-        if refresh_error and refresh_error["value"]:
-            warning += f" Error: {refresh_error['value']}"
     return DashboardResponse(
         **data,
-        last_refresh=last_refresh["updated_at"] if last_refresh else None,
-        refresh_mode=refresh_status["value"] if refresh_status else None,
-        warning=warning,
+        last_refresh=snapshot.last_refresh,
+        refresh_mode=snapshot.refresh_mode,
+        warning=_sync_warning(),
         cooldown_seconds=cooldown_seconds,
+        sync_in_progress=snapshot.sync_in_progress,
+        sync_requested_by=snapshot.sync_requested_by,
+        sync_started_at=snapshot.sync_started_at,
     )
 
 
