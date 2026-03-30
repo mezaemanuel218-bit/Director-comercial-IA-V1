@@ -277,6 +277,10 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "pendientes", "compromiso", "compromisos", "tarea", "tareas"])
     asks_for_latest_note = any(token in q for token in ["ultima nota", "última nota", "nota agregada", "nota mas reciente", "nota más reciente"])
 
+    if asks_for_last_contact:
+        asks_for_names = False
+        asks_for_contact_directory = False
+
     analysis_signals = [
         "plan",
         "estrategia",

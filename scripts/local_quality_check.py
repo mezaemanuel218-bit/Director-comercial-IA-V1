@@ -190,6 +190,14 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
     ]
     questions.extend(formatting_questions)
 
+    product_questions = [
+        {"username": "emeza", "question": "que dice geotab sobre seguridad y mantenimiento"},
+        {"username": "emeza", "question": "segun los pdfs, que beneficios de flotimatics ayudan a una flotilla con mas control operativo"},
+        {"username": "evaldez", "question": "hazme un resumen ejecutivo de los pdfs para vender flotimatics a direccion"},
+        {"username": "emeza", "question": "con base en los documentos internos, dame argumentos de venta para una demo de geotab"},
+    ]
+    questions.extend(product_questions)
+
     while len(questions) < 420:
         entity = entities[len(questions) % max(1, len(entities))]
         owner = owners[len(questions) % max(1, len(owners))]

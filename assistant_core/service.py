@@ -3,6 +3,7 @@ import json
 import re
 import sqlite3
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
@@ -151,7 +152,7 @@ class SalesAssistantService:
         )
 
     def get_priority_followups(self, owner: str | None = None, limit: int = 12) -> list[dict[str, Any]]:
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             query = """
             WITH latest AS (
                 SELECT
@@ -268,7 +269,20 @@ class SalesAssistantService:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.create_function(
+            "norm",
+            1,
+            lambda value: self._normalize_search_text(str(value)) if value is not None else "",
+        )
         return conn
+
+    @contextmanager
+    def _managed_connection(self):
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _semantic_split_question(self, question: str, user: AppUser | None = None) -> list[str]:
         heuristic_parts = self._split_compound_question(question)
@@ -343,9 +357,13 @@ class SalesAssistantService:
         if semantic:
             return semantic
         if len(subresponses) <= 2:
+            if any(response.evidence.get("entity_suggestions") for response in subresponses):
+                preferred = [response for response in subresponses if response.evidence.get("entity_suggestions")]
+            else:
+                preferred = subresponses
             merged: list[str] = []
             seen: set[str] = set()
-            for response in subresponses:
+            for response in preferred:
                 answer = response.answer.strip()
                 if not answer:
                     continue
@@ -371,6 +389,8 @@ class SalesAssistantService:
         if not self.client or len(subresponses) < 2:
             return None
         if all(not response.answer.strip() for response in subresponses):
+            return None
+        if any(response.evidence.get("entity_suggestions") for response in subresponses):
             return None
         try:
             joined = []
@@ -500,7 +520,9 @@ class SalesAssistantService:
             ]
         )
         desired_format = "default"
-        if "correo" in normalized or "mail" in normalized or "email" in normalized:
+        if intent.asks_for_contact_directory or (intent.asks_for_names and (intent.asks_for_emails or intent.asks_for_phones)):
+            desired_format = "default"
+        elif "correo" in normalized or "mail" in normalized or "email" in normalized:
             desired_format = "email"
         elif "whatsapp" in normalized or "mensaje" in normalized:
             desired_format = "message"
@@ -641,6 +663,8 @@ class SalesAssistantService:
         task = pack.task
         if task.desired_format == "conclusion_evidence":
             return self._format_conclusion_then_evidence(pack)
+        if evidence.get("entity_suggestions") and evidence.get("entity_hint") and not evidence.get("entity_brief"):
+            return self._format_entity_suggestions(evidence["entity_hint"], evidence["entity_suggestions"])
         if evidence.get("action_plan"):
             return self._format_action_plan(evidence["action_plan"])
         if task.task_type in {"recommend", "summarize"} and evidence.get("owner_brief") and not evidence.get("entity_brief"):
@@ -696,6 +720,8 @@ class SalesAssistantService:
             "risk_profile",
         ]
         if any(evidence.get(key) for key in gpt_sensitive_structured_keys):
+            return True
+        if evidence.get("entity_suggestions") and evidence.get("entity_hint"):
             return True
         if task.task_type in {"create", "recommend", "summarize", "compare"}:
             return False
@@ -770,7 +796,7 @@ class SalesAssistantService:
             "direct_answer": None,
         }
 
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             if owner_scope:
                 evidence["owner_scope"] = owner_scope
             if entity_term:
@@ -978,7 +1004,36 @@ class SalesAssistantService:
         ]
         if any(phrase in normalized for phrase in generic_phrases):
             return None
+        if any(
+            phrase in normalized
+            for phrase in [
+                "a quien le hable ayer",
+                "a quien le hable antier",
+                "a quien le hable anteayer",
+                "interacciones de ayer",
+                "interacciones de antier",
+                "interacciones de anteayer",
+                "kpi global",
+                "kpis globales",
+                "todos los vendedores",
+                "todo el equipo",
+                "equipo comercial",
+            ]
+        ):
+            return None
         if "min libres" in normalized and "plan de trabajo" in normalized:
+            return None
+        if any(
+            phrase in normalized
+            for phrase in [
+                "segun los pdfs",
+                "segun los documentos",
+                "en los pdfs",
+                "en los documentos",
+                "de acuerdo con los pdfs",
+                "de acuerdo con los documentos",
+            ]
+        ):
             return None
         sales_patterns = [
             r"(?:mandarle|enviarle|escribirle)\s+a\s+(.+?)(?:,|$)",
@@ -999,6 +1054,19 @@ class SalesAssistantService:
                 return trailing
         specific_patterns = [
             r"kpi(?:s)?\s+(.+?)\s+de\s+la\s+semana$",
+            r"que me dices de\s+(.+?)(?:\?|$)",
+            r"que me puedes decir de\s+(.+?)(?:\?|$)",
+            r"que me puedes decir sobre\s+(.+?)(?:\?|$)",
+            r"que informacion tienes de\s+(.+?)(?:\?|$)",
+            r"que informacion tienes sobre\s+(.+?)(?:\?|$)",
+            r"que informacion hay de\s+(.+?)(?:\?|$)",
+            r"que informacion hay sobre\s+(.+?)(?:\?|$)",
+            r"que sabes de\s+(.+?)(?:\?|$)",
+            r"que sabes sobre\s+(.+?)(?:\?|$)",
+            r"hablame de\s+(.+?)(?:\?|$)",
+            r"hablame sobre\s+(.+?)(?:\?|$)",
+            r"que plan de accion me recomiendas para\s+(.+?)(?:\?|$)",
+            r"plan de accion para\s+(.+?)(?:\?|$)",
             r"como vamos con\s+(.+)$",
             r"que sigue con\s+(.+)$",
             r"que decision maker ves en\s+(.+)$",
@@ -1026,8 +1094,8 @@ class SalesAssistantService:
         patterns = [
             r"(?:correos?|emails?|telefonos?|numeros?|nombres?|contactos?)\s+(?:de|del)\s+(.+)$",
             r"(?:cliente|prospecto|contacto|empresa)\s*:\s*(.+)$",
-            r"(?:plan|accion|riesgos?|ultimo contacto)\s+(?:de|del|para)\s+(.+)$",
-            r"(?:de|del|para)\s+(.+)$",
+            r"(?:accion|riesgos?|ultimo contacto)\s+(?:de|del|para)\s+(.+)$",
+            r"^(?:de|del|para)\s+(.+)$",
         ]
         for pattern in patterns:
             match = re.search(pattern, normalized, flags=re.IGNORECASE)
@@ -1065,7 +1133,7 @@ class SalesAssistantService:
         return None
 
     def _is_noise_entity_hint(self, candidate: str) -> bool:
-        return candidate in {
+        if candidate in {
             "alta",
             "de alta",
             "baja",
@@ -1079,7 +1147,31 @@ class SalesAssistantService:
             "el mes",
             "mes",
             "ese nombre",
-        }
+        }:
+            return True
+        return any(
+            candidate.startswith(prefix)
+            for prefix in [
+                "que informacion",
+                "que me puedes",
+                "que me dices",
+                "que sabes",
+                "como vamos",
+                "quien ",
+                "cual ",
+                "cuanto ",
+                "cuantos ",
+                "cuanta ",
+                "cuantas ",
+                "dame ",
+                "hazme ",
+                "quiero ",
+                "necesito ",
+                "que sigue",
+                "que plan",
+                "hablame",
+            ]
+        )
 
     def _resolve_entity(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> EntityResolution:
         cleaned = self._clean_search_term(term)
@@ -1249,7 +1341,7 @@ class SalesAssistantService:
         params: list[Any] = []
         for pattern in patterns:
             for field in ["company_name", "contact_name", "full_name", "email", "phone"]:
-                field_clauses.append(f"lower(coalesce({field}, '')) LIKE lower(?)")
+                field_clauses.append(f"norm({field}) LIKE ?")
                 params.append(pattern)
         query = query.format(clauses=" OR ".join(field_clauses))
         if owner_scope:
@@ -1275,7 +1367,7 @@ class SalesAssistantService:
         params: list[Any] = []
         for pattern in patterns:
             params.append(pattern)
-        query = query.format(clauses=" OR ".join("lower(coalesce(related_name, '')) LIKE lower(?)" for _ in patterns))
+        query = query.format(clauses=" OR ".join("norm(related_name) LIKE ?" for _ in patterns))
         if owner_scope:
             query += " AND owner_name = ?"
             params.append(owner_scope)
@@ -1301,9 +1393,9 @@ class SalesAssistantService:
         params: list[Any] = []
         note_clauses = []
         for pattern in patterns:
-            note_clauses.append("lower(coalesce(parent_name, '')) LIKE lower(?)")
+            note_clauses.append("norm(parent_name) LIKE ?")
             params.append(pattern)
-            note_clauses.append("lower(coalesce(content_text, '')) LIKE lower(?)")
+            note_clauses.append("norm(content_text) LIKE ?")
             params.append(pattern)
         query = query.format(clauses=" OR ".join(note_clauses))
         if owner_scope:
@@ -1417,7 +1509,7 @@ class SalesAssistantService:
         params: list[Any] = []
         for pattern in patterns:
             for field in ["company_name", "contact_name", "full_name", "email", "phone"]:
-                profile_clauses.append(f"lower(coalesce({field}, '')) LIKE lower(?)")
+                profile_clauses.append(f"norm({field}) LIKE ?")
                 params.append(pattern)
         query = query.format(clauses=" OR ".join(profile_clauses))
         if owner_scope:
@@ -1441,7 +1533,7 @@ class SalesAssistantService:
         params: list[Any] = []
         for pattern in patterns:
             for field in ["contact_name", "subject", "description"]:
-                task_clauses.append(f"lower(coalesce({field}, '')) LIKE lower(?)")
+                task_clauses.append(f"norm({field}) LIKE ?")
                 params.append(pattern)
         query = query.format(clauses=" OR ".join(task_clauses))
         if owner_scope:
@@ -2117,7 +2209,7 @@ class SalesAssistantService:
             """
             SELECT parent_name, created_time, owner_name, content_text
             FROM notes
-            WHERE lower(coalesce(content_text,'')) LIKE lower(?)
+            WHERE norm(content_text) LIKE ?
             ORDER BY created_time DESC
             LIMIT 5
             """,
@@ -2308,7 +2400,7 @@ class SalesAssistantService:
         """
         params: list[Any] = []
         if term:
-            query += " AND lower(coalesce(related_name, '')) LIKE lower(?)"
+            query += " AND norm(related_name) LIKE ?"
             params.append(f"%{self._clean_search_term(term)}%")
         if owner_scope:
             query += " AND owner_name = ?"
@@ -2475,15 +2567,20 @@ class SalesAssistantService:
         if not unique_terms:
             return []
 
-        clauses = " OR ".join("lower(content) LIKE lower(?)" for _ in unique_terms)
+        clauses: list[str] = []
+        values: list[str] = []
+        for term in unique_terms:
+            clauses.append("norm(dc.content) LIKE ?")
+            values.append(f"%{term}%")
+            clauses.append("norm(d.file_name) LIKE ?")
+            values.append(f"%{term}%")
         query = f"""
         SELECT d.file_name, dc.chunk_index, dc.content
         FROM document_chunks dc
         JOIN documents d ON d.id = dc.document_id
-        WHERE {clauses}
+        WHERE {' OR '.join(clauses)}
         LIMIT 8
         """
-        values = [f"%{term}%" for term in unique_terms]
         try:
             return [dict(row) for row in conn.execute(query, values).fetchall()]
         except sqlite3.OperationalError:
@@ -2508,7 +2605,7 @@ class SalesAssistantService:
                 key = self._normalize_search_text(user.crm_owner_name)
                 aliases[key] = user.crm_owner_name
 
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             try:
                 rows = conn.execute("SELECT DISTINCT name FROM owners WHERE name IS NOT NULL").fetchall()
             except sqlite3.OperationalError:
@@ -3241,7 +3338,7 @@ class SalesAssistantService:
     def _format_assigned_clients(self, rows: list[dict[str, Any]], owner_scope: str | None) -> str:
         if not rows:
             if owner_scope:
-                with self._connect() as conn:
+                with self._managed_connection() as conn:
                     presence = self._owner_presence_summary(conn, owner_scope)
                 if presence.get("interaction_count") or presence.get("note_count"):
                     lines = [

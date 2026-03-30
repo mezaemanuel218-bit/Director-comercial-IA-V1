@@ -49,6 +49,30 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("Jesus Emmanuel Meza", answer)
         self.assertIn("Pablo Melin Dorador", answer)
 
+    def test_contact_directory_query_keeps_directory_format(self) -> None:
+        response = self.service.answer_question("dame nombres, telefonos y correos de contacto de movimex")
+        answer = response.answer.lower()
+        self.assertIn("contactos de movimex disponibles", answer)
+        self.assertIn("dena salinas", answer)
+        self.assertNotIn("asunto:", answer)
+
+    def test_last_contact_query_returns_interactions_not_contact_directory(self) -> None:
+        response = self.service.answer_question("ultimo contacto de movimex")
+        answer = response.answer.lower()
+        self.assertIn("movimex | note |", answer)
+        self.assertNotIn("contactos de movimex disponibles", answer)
+
+    def test_yesterday_contacts_query_is_not_treated_as_entity_lookup(self) -> None:
+        response = self.service.answer_question("a quien le hable ayer", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertNotIn("lo mas cercano que si veo en crm es", answer)
+
+    def test_global_weekly_kpis_are_not_treated_as_entity_lookup(self) -> None:
+        response = self.service.answer_question("kpi global de la semana de todos los vendedores", user=get_user("evaldez"))
+        answer = response.answer.lower()
+        self.assertIn("panorama comercial del equipo flotimatics", answer)
+        self.assertNotIn("lo mas cercano que si veo en crm es", answer)
+
     def test_entity_comparison_uses_existing_crm_evidence(self) -> None:
         response = self.service.answer_question("compara Hieleria Veracruz vs Servicios y Minas de Mexico Actus")
         answer = response.answer.lower()
@@ -212,6 +236,13 @@ class SalesAssistantServiceTests(unittest.TestCase):
         answer = response.answer.lower()
         self.assertIn("geotab", answer)
         self.assertNotIn("no encontre clientes asignados", answer)
+
+    def test_document_search_returns_pdf_chunks_for_geotab_product_question(self) -> None:
+        with self.service._managed_connection() as conn:
+            chunks = self.service._document_search(conn, "que dice geotab sobre seguridad y mantenimiento")
+        self.assertTrue(chunks)
+        flattened = " ".join(f"{row.get('file_name', '')} {row.get('content', '')}" for row in chunks).lower()
+        self.assertIn("geotab", flattened)
 
     def test_free_minutes_work_plan_should_not_jump_to_random_account(self) -> None:
         response = self.service.answer_question("tengo 30 min libres, hazme un plan de trabajo", user=self.emeza)
