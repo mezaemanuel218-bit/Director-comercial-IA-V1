@@ -48,6 +48,7 @@ class QuestionIntent:
     asks_for_latest_contacted: bool
     asks_for_today_pending: bool
     asks_for_latest_note: bool
+    asks_for_time_review: bool
 
 
 def classify_question(question: str) -> QuestionIntent:
@@ -276,6 +277,79 @@ def classify_question(question: str) -> QuestionIntent:
     asks_for_latest_contacted = any(token in q for token in ["ultimo cliente", "cliente que se contacto a lo ultimo"])
     asks_for_today_pending = "hoy" in q and any(token in q for token in ["pendiente", "pendientes", "compromiso", "compromisos", "tarea", "tareas"])
     asks_for_latest_note = any(token in q for token in ["ultima nota", "última nota", "nota agregada", "nota mas reciente", "nota más reciente"])
+    time_markers = [
+        "hoy",
+        "ayer",
+        "antier",
+        "anteayer",
+        "esta semana",
+        "semana pasada",
+        "este mes",
+        "mes pasado",
+        "enero",
+        "febrero",
+        "marzo",
+        "abril",
+        "mayo",
+        "junio",
+        "julio",
+        "agosto",
+        "septiembre",
+        "setiembre",
+        "octubre",
+        "noviembre",
+        "diciembre",
+        "ultimos ",
+        "ultimas ",
+        "últimos ",
+        "últimas ",
+        "fecha ",
+        "dia ",
+        "día ",
+        "/",
+        "-",
+    ]
+    time_review_markers = [
+        "que paso",
+        "que paso ",
+        "que hubo",
+        "que dijeron",
+        "que se dijo",
+        "que comentarios",
+        "que comentario",
+        "quien agrego",
+        "quien agregó",
+        "quien hizo",
+        "quien movio",
+        "quien movió",
+        "que actividad",
+        "que actividades",
+        "que interacciones",
+        "que notas",
+        "que llamadas",
+        "que tareas",
+        "que compromisos",
+        "que eventos",
+        "que se agrego",
+        "que se agregó",
+        "desde cuando",
+        "en esa fecha",
+        "ese dia",
+        "ese día",
+        "aquel dia",
+        "aquel día",
+    ]
+    asks_for_time_review = (
+        any(marker in q for marker in time_markers)
+        and (
+            any(marker in q for marker in time_review_markers)
+            or any(token in q for token in ["comentarios", "comentario", "notas", "interacciones", "compromisos", "tareas", "eventos", "llamadas"])
+        )
+        and not asks_for_action_plan
+        and not asks_for_today_call_list
+        and not asks_for_owner_brief
+        and not asks_for_team_brief
+    )
 
     if asks_for_last_contact:
         asks_for_names = False
@@ -346,4 +420,5 @@ def classify_question(question: str) -> QuestionIntent:
         asks_for_latest_contacted=asks_for_latest_contacted,
         asks_for_today_pending=asks_for_today_pending,
         asks_for_latest_note=asks_for_latest_note,
+        asks_for_time_review=asks_for_time_review,
     )

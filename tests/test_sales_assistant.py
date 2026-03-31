@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 
 from assistant_core.auth import get_user
-from assistant_core.history import ensure_history_schema, fetch_history, save_history
+from assistant_core.history import ensure_history_schema, fetch_feedback, fetch_feedback_memory, fetch_history, save_feedback, save_history
 from assistant_core.query_intent import classify_question
 from assistant_core.service import SalesAssistantService
 import assistant_core.history as history_module
@@ -107,6 +107,10 @@ class SalesAssistantServiceTests(unittest.TestCase):
     def test_latest_note_query_should_be_detected(self) -> None:
         intent = classify_question("ultima nota agregada")
         self.assertTrue(intent.asks_for_latest_note)
+
+    def test_specific_day_review_query_should_be_detected(self) -> None:
+        intent = classify_question("que paso el 19 de marzo de 2026")
+        self.assertTrue(intent.asks_for_time_review)
 
     def test_sales_email_draft_query_should_be_detected(self) -> None:
         intent = classify_question(
@@ -244,6 +248,64 @@ class SalesAssistantServiceTests(unittest.TestCase):
         flattened = " ".join(f"{row.get('file_name', '')} {row.get('content', '')}" for row in chunks).lower()
         self.assertIn("geotab", flattened)
 
+    def test_time_window_parser_supports_specific_day(self) -> None:
+        window = self.service._parse_time_window("que paso el 19 de marzo de 2026")
+        self.assertIsNotNone(window)
+        self.assertEqual(window.start_date.isoformat(), "2026-03-19")
+        self.assertEqual(window.end_date.isoformat(), "2026-03-19")
+
+    def test_time_window_parser_supports_weekly_windows(self) -> None:
+        window = self.service._parse_time_window("que hubo esta semana")
+        self.assertIsNotNone(window)
+        self.assertEqual(window.granularity, "week")
+        self.assertLessEqual(window.start_date, window.end_date)
+
+    def test_time_window_parser_supports_previous_month(self) -> None:
+        window = self.service._parse_time_window("que paso el mes pasado")
+        self.assertIsNotNone(window)
+        self.assertEqual(window.granularity, "month")
+        self.assertLessEqual(window.start_date, window.end_date)
+
+    def test_time_window_parser_supports_explicit_range(self) -> None:
+        window = self.service._parse_time_window("que hubo del 18 al 19 de marzo de 2026")
+        self.assertIsNotNone(window)
+        self.assertEqual(window.start_date.isoformat(), "2026-03-18")
+        self.assertEqual(window.end_date.isoformat(), "2026-03-19")
+
+    def test_specific_day_review_returns_temporal_summary(self) -> None:
+        response = self.service.answer_question("que paso el 19 de marzo de 2026")
+        answer = response.answer.lower()
+        self.assertIn("2026-03-19", answer)
+        self.assertIn("movimientos detectados", answer)
+
+    def test_specific_day_who_added_something_lists_owners(self) -> None:
+        response = self.service.answer_question("quien agrego algo el 19 de marzo de 2026")
+        answer = response.answer.lower()
+        self.assertIn("personas que registraron movimiento", answer)
+        self.assertTrue(
+            "eduardo valdez" in answer
+            or "pablo melin dorador" in answer
+            or "ayuda consultoria" in answer
+        )
+
+    def test_specific_day_comments_return_note_snippets(self) -> None:
+        response = self.service.answer_question("que comentarios hubo el 18 de marzo de 2026", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("comentarios y notas visibles", answer)
+        self.assertTrue("hospital san jose" in answer or "hieleria veracruz" in answer or "autolineas de pasaje alp" in answer)
+
+    def test_specific_day_commitments_return_tasks_or_events(self) -> None:
+        response = self.service.answer_question("que compromisos hubo el 13 de marzo de 2023")
+        answer = response.answer.lower()
+        self.assertIn("compromisos, tareas y eventos detectados", answer)
+        self.assertIn("seguimiento a correo", answer)
+
+    def test_entity_time_review_keeps_entity_scope(self) -> None:
+        response = self.service.answer_question("que paso con movimex el 11 de marzo de 2026")
+        answer = response.answer.lower()
+        self.assertIn("movimex", answer)
+        self.assertIn("2026-03-11", answer)
+
     def test_free_minutes_work_plan_should_not_jump_to_random_account(self) -> None:
         response = self.service.answer_question("tengo 30 min libres, hazme un plan de trabajo", user=self.emeza)
         answer = response.answer.lower()
@@ -277,6 +339,20 @@ class SalesAssistantServiceTests(unittest.TestCase):
             )
         )
 
+    def test_feedback_override_uses_high_similarity_correction(self) -> None:
+        override = self.service._feedback_override(
+            {
+                "feedback_memory": [
+                    {
+                        "question": "dame correos de movimex",
+                        "correction": "Debio incluir a Dena Salinas y gps@movimex.mx.",
+                        "similarity": 0.97,
+                    }
+                ]
+            }
+        )
+        self.assertIn("gps@movimex.mx", override)
+
 
 class HistoryIsolationTests(unittest.TestCase):
     def test_history_can_be_filtered_by_username(self) -> None:
@@ -301,6 +377,64 @@ class HistoryIsolationTests(unittest.TestCase):
             self.assertEqual(emeza_items[0]["username"], "emeza")
             self.assertEqual(pmelin_items[0]["username"], "pmelin")
             self.assertEqual(len(all_items), 2)
+        finally:
+            history_module.WAREHOUSE_DB = original_db
+            if history_db.exists():
+                history_db.unlink()
+
+    def test_feedback_can_be_saved_and_loaded(self) -> None:
+        original_db = history_module.WAREHOUSE_DB
+        temp_dir = Path("data/test-feedback")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        history_db = temp_dir / "feedback.db"
+        if history_db.exists():
+            history_db.unlink()
+        try:
+            history_module.WAREHOUSE_DB = history_db
+            ensure_history_schema()
+            history_id = save_history("q1", "a1", "data", ["warehouse.db"], False, username="emeza")
+            feedback_id = save_feedback(history_id, "bad", username="emeza", correction="Debio responder con el contacto correcto.")
+            items = fetch_feedback(username="emeza")
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["id"], feedback_id)
+            self.assertEqual(items[0]["history_id"], history_id)
+            self.assertEqual(items[0]["rating"], "bad")
+            self.assertIn("contacto correcto", items[0]["correction"])
+        finally:
+            history_module.WAREHOUSE_DB = original_db
+            if history_db.exists():
+                history_db.unlink()
+
+    def test_feedback_memory_returns_similar_corrected_question(self) -> None:
+        original_db = history_module.WAREHOUSE_DB
+        temp_dir = Path("data/test-feedback-memory")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        history_db = temp_dir / "feedback_memory.db"
+        if history_db.exists():
+            history_db.unlink()
+        try:
+            history_module.WAREHOUSE_DB = history_db
+            ensure_history_schema()
+            history_id = save_history(
+                "dame correos de movimex",
+                "No encontre correos.",
+                "data",
+                ["warehouse.db"],
+                False,
+                username="emeza",
+            )
+            save_feedback(
+                history_id,
+                "bad",
+                username="emeza",
+                correction="Debio incluir a Dena Salinas y gps@movimex.mx.",
+            )
+            memories = fetch_feedback_memory("dame solo los correos y nombres de movimex", username="emeza")
+
+            self.assertEqual(len(memories), 1)
+            self.assertIn("movimex", memories[0]["question"].lower())
+            self.assertIn("dena salinas", memories[0]["correction"].lower())
         finally:
             history_module.WAREHOUSE_DB = original_db
             if history_db.exists():

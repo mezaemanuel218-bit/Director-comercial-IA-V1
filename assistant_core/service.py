@@ -5,7 +5,7 @@ import sqlite3
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -14,7 +14,7 @@ from openai import OpenAI
 
 from assistant_core.auth import APP_USERS, AppUser
 from assistant_core.config import WAREHOUSE_DB
-from assistant_core.history import fetch_history
+from assistant_core.history import fetch_feedback_memory, fetch_history
 from assistant_core.query_intent import QuestionIntent, classify_question
 from assistant_core.utils import strip_html
 
@@ -24,6 +24,21 @@ load_dotenv()
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:(?:\+?\d[\d\s().-]{6,}\d))")
+MONTH_NAME_TO_NUMBER = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
 
 
 @dataclass
@@ -76,6 +91,14 @@ class EvidencePack:
     evidence: dict[str, Any]
 
 
+@dataclass
+class TimeWindow:
+    start_date: date
+    end_date: date
+    label: str
+    granularity: str
+
+
 class SalesAssistantService:
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path = db_path or str(WAREHOUSE_DB)
@@ -114,6 +137,15 @@ class SalesAssistantService:
             "response_style": pack.task.response_style,
             "depth": pack.task.depth,
         }
+        feedback_override = self._feedback_override(evidence)
+        if feedback_override:
+            return AssistantResponse(
+                mode=intent.mode,
+                sources=evidence["sources"],
+                used_web=False,
+                answer=feedback_override,
+                evidence=evidence,
+            )
 
         if evidence.get("direct_answer") and self._should_prefer_direct_answer(intent, evidence, task):
             return AssistantResponse(
@@ -150,6 +182,275 @@ class SalesAssistantService:
             answer=answer,
             evidence=evidence,
         )
+
+    def _feedback_override(self, evidence: dict[str, Any]) -> str | None:
+        feedback_rows = evidence.get("feedback_memory") or []
+        if not feedback_rows:
+            return None
+        top = feedback_rows[0]
+        correction = (top.get("correction") or "").strip()
+        similarity = float(top.get("similarity") or 0)
+        if not correction or similarity < 0.9:
+            return None
+        return correction
+
+    def _today(self) -> date:
+        return datetime.now().date()
+
+    def _end_of_month(self, year: int, month: int) -> date:
+        if month == 12:
+            return date(year + 1, 1, 1) - timedelta(days=1)
+        return date(year, month + 1, 1) - timedelta(days=1)
+
+    def _safe_date(self, year: int, month: int, day: int) -> date | None:
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    def _looks_like_date_phrase(self, candidate: str | None) -> bool:
+        normalized = self._normalize_search_text(candidate or "")
+        if not normalized:
+            return False
+        if re.fullmatch(r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?", normalized):
+            return True
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return True
+        if any(month in normalized for month in MONTH_NAME_TO_NUMBER):
+            if re.search(r"\b\d{1,2}\b", normalized) or any(
+                marker in normalized
+                for marker in ["hoy", "ayer", "antier", "anteayer", "esta semana", "semana pasada", "este mes", "mes pasado"]
+            ):
+                return True
+        return False
+
+    def _parse_time_window(self, question: str) -> TimeWindow | None:
+        normalized = self._normalize_search_text(question)
+        today = self._today()
+
+        if "hoy" in normalized:
+            return TimeWindow(today, today, f"hoy ({today.isoformat()})", "day")
+        if "anteayer" in normalized or "antier" in normalized:
+            target = today - timedelta(days=2)
+            return TimeWindow(target, target, f"antier ({target.isoformat()})", "day")
+        if "ayer" in normalized:
+            target = today - timedelta(days=1)
+            return TimeWindow(target, target, f"ayer ({target.isoformat()})", "day")
+        if "esta semana" in normalized:
+            start = today - timedelta(days=today.weekday())
+            return TimeWindow(start, today, f"esta semana ({start.isoformat()} a {today.isoformat()})", "week")
+        if "semana pasada" in normalized:
+            end = today - timedelta(days=today.weekday() + 1)
+            start = end - timedelta(days=6)
+            return TimeWindow(start, end, f"semana pasada ({start.isoformat()} a {end.isoformat()})", "week")
+        if "este mes" in normalized:
+            start = date(today.year, today.month, 1)
+            return TimeWindow(start, today, f"este mes ({start.isoformat()} a {today.isoformat()})", "month")
+        if "mes pasado" in normalized:
+            if today.month == 1:
+                year = today.year - 1
+                month = 12
+            else:
+                year = today.year
+                month = today.month - 1
+            start = date(year, month, 1)
+            end = self._end_of_month(year, month)
+            return TimeWindow(start, end, f"mes pasado ({start.isoformat()} a {end.isoformat()})", "month")
+
+        range_match = re.search(
+            r"(?:del|desde)\s+(\d{1,2})\s+(?:al|a|hasta)\s+(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?",
+            normalized,
+        )
+        if range_match and range_match.group(3) in MONTH_NAME_TO_NUMBER:
+            month = MONTH_NAME_TO_NUMBER[range_match.group(3)]
+            year = int(range_match.group(4) or today.year)
+            start = self._safe_date(year, month, int(range_match.group(1)))
+            end = self._safe_date(year, month, int(range_match.group(2)))
+            if start and end and start <= end:
+                return TimeWindow(start, end, f"del {start.isoformat()} al {end.isoformat()}", "range")
+
+        iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", normalized)
+        if iso_match:
+            target = self._safe_date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
+            if target:
+                return TimeWindow(target, target, target.isoformat(), "day")
+
+        slash_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", normalized)
+        if slash_match:
+            day = int(slash_match.group(1))
+            month = int(slash_match.group(2))
+            year = int(slash_match.group(3) or today.year)
+            if year < 100:
+                year += 2000
+            target = self._safe_date(year, month, day)
+            if target:
+                return TimeWindow(target, target, target.isoformat(), "day")
+
+        month_day_match = re.search(r"(?:el\s+)?dia\s+(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?", normalized)
+        if not month_day_match:
+            month_day_match = re.search(r"\b(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?", normalized)
+        if month_day_match and month_day_match.group(2) in MONTH_NAME_TO_NUMBER:
+            month = MONTH_NAME_TO_NUMBER[month_day_match.group(2)]
+            year = int(month_day_match.group(3) or today.year)
+            target = self._safe_date(year, month, int(month_day_match.group(1)))
+            if target:
+                return TimeWindow(target, target, target.isoformat(), "day")
+
+        numeric_month_match = re.search(r"dia\s+(\d{1,2})\s+del?\s+mes\s+(\d{1,2})(?:\s+de\s+(\d{4}))?", normalized)
+        if numeric_month_match:
+            target = self._safe_date(
+                int(numeric_month_match.group(3) or today.year),
+                int(numeric_month_match.group(2)),
+                int(numeric_month_match.group(1)),
+            )
+            if target:
+                return TimeWindow(target, target, target.isoformat(), "day")
+
+        rolling_match = re.search(r"ultim[oa]s?\s+(\d{1,2})\s+(dias|semanas|meses)", normalized)
+        if rolling_match:
+            amount = int(rolling_match.group(1))
+            unit = rolling_match.group(2)
+            if unit == "dias":
+                start = today - timedelta(days=max(0, amount - 1))
+            elif unit == "semanas":
+                start = today - timedelta(days=max(0, amount * 7 - 1))
+            else:
+                start = today - timedelta(days=max(0, amount * 30 - 1))
+            return TimeWindow(start, today, f"ultimos {amount} {unit} ({start.isoformat()} a {today.isoformat()})", "range")
+
+        return None
+
+    def _entity_filter_clause(
+        self,
+        field_name: str,
+        term: str | None,
+        resolution: EntityResolution | None = None,
+    ) -> tuple[str, list[Any]]:
+        cleaned = self._clean_search_term(term or "")
+        aliases = [cleaned] if cleaned else []
+        if resolution:
+            aliases.extend(self._clean_search_term(alias) for alias in resolution.aliases)
+            if resolution.canonical_name:
+                aliases.append(self._clean_search_term(resolution.canonical_name))
+        patterns = [alias for alias in dict.fromkeys(aliases) if alias]
+        if not patterns:
+            return "", []
+        clauses = [f"norm({field_name}) LIKE ?" for _ in patterns]
+        params = [f"%{pattern}%" for pattern in patterns]
+        return f" AND ({' OR '.join(clauses)})", params
+
+    def _time_window_overview(
+        self,
+        conn: sqlite3.Connection,
+        window: TimeWindow,
+        question: str,
+        owner_scope: str | None = None,
+        entity_term: str | None = None,
+    ) -> dict[str, Any]:
+        resolution = self._resolve_entity(conn, entity_term, owner_scope=owner_scope) if entity_term else None
+
+        interactions_query = """
+        SELECT related_name, owner_name, source_type, interaction_at, status, summary
+        FROM interactions
+        WHERE date(interaction_at) >= date(?)
+          AND date(interaction_at) <= date(?)
+        """
+        interactions_params: list[Any] = [window.start_date.isoformat(), window.end_date.isoformat()]
+        if owner_scope:
+            interactions_query += " AND owner_name = ?"
+            interactions_params.append(owner_scope)
+        entity_clause, entity_params = self._entity_filter_clause("related_name", entity_term, resolution)
+        interactions_query += entity_clause
+        interactions_params.extend(entity_params)
+        interactions_query += " ORDER BY interaction_at DESC LIMIT 80"
+        interactions = [dict(row) for row in conn.execute(interactions_query, interactions_params).fetchall()]
+
+        notes_query = """
+        SELECT parent_name, owner_name, created_time, title, content_text
+        FROM notes
+        WHERE date(created_time) >= date(?)
+          AND date(created_time) <= date(?)
+        """
+        notes_params: list[Any] = [window.start_date.isoformat(), window.end_date.isoformat()]
+        if owner_scope:
+            notes_query += " AND owner_name = ?"
+            notes_params.append(owner_scope)
+        entity_clause, entity_params = self._entity_filter_clause("parent_name", entity_term, resolution)
+        notes_query += entity_clause
+        notes_params.extend(entity_params)
+        notes_query += " ORDER BY created_time DESC LIMIT 80"
+        notes = [dict(row) for row in conn.execute(notes_query, notes_params).fetchall()]
+
+        tasks_query = """
+        SELECT owner_name, contact_name, subject, status, priority, due_date, created_time, description
+        FROM tasks
+        WHERE (
+            date(coalesce(due_date, created_time)) >= date(?)
+            AND date(coalesce(due_date, created_time)) <= date(?)
+        )
+        """
+        tasks_params: list[Any] = [window.start_date.isoformat(), window.end_date.isoformat()]
+        if owner_scope:
+            tasks_query += " AND owner_name = ?"
+            tasks_params.append(owner_scope)
+        entity_clause, entity_params = self._entity_filter_clause("contact_name", entity_term, resolution)
+        tasks_query += entity_clause
+        tasks_params.extend(entity_params)
+        tasks_query += " ORDER BY coalesce(due_date, created_time) DESC LIMIT 80"
+        tasks = [dict(row) for row in conn.execute(tasks_query, tasks_params).fetchall()]
+
+        events_query = """
+        SELECT owner_name, contact_name, title, start_time, end_time, created_time, description
+        FROM events
+        WHERE date(coalesce(start_time, created_time)) >= date(?)
+          AND date(coalesce(start_time, created_time)) <= date(?)
+        """
+        events_params: list[Any] = [window.start_date.isoformat(), window.end_date.isoformat()]
+        if owner_scope:
+            events_query += " AND owner_name = ?"
+            events_params.append(owner_scope)
+        entity_clause, entity_params = self._entity_filter_clause("contact_name", entity_term, resolution)
+        events_query += entity_clause
+        events_params.extend(entity_params)
+        events_query += " ORDER BY coalesce(start_time, created_time) DESC LIMIT 60"
+        events = [dict(row) for row in conn.execute(events_query, events_params).fetchall()]
+
+        owner_counts: dict[str, int] = {}
+        for row in interactions:
+            owner = row.get("owner_name") or "Sin responsable"
+            owner_counts[owner] = owner_counts.get(owner, 0) + 1
+        for row in notes:
+            owner = row.get("owner_name") or "Sin responsable"
+            owner_counts[owner] = owner_counts.get(owner, 0) + 1
+        for row in tasks:
+            owner = row.get("owner_name") or "Sin responsable"
+            owner_counts[owner] = owner_counts.get(owner, 0) + 1
+        for row in events:
+            owner = row.get("owner_name") or "Sin responsable"
+            owner_counts[owner] = owner_counts.get(owner, 0) + 1
+
+        owner_activity = [
+            {"owner_name": owner_name, "total_items": total_items}
+            for owner_name, total_items in sorted(owner_counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
+
+        return {
+            "window": {
+                "start_date": window.start_date.isoformat(),
+                "end_date": window.end_date.isoformat(),
+                "label": window.label,
+                "granularity": window.granularity,
+            },
+            "entity_term": entity_term,
+            "entity_resolution": resolution.canonical_name if resolution else None,
+            "owner_scope": owner_scope,
+            "interactions": interactions,
+            "notes": notes,
+            "tasks": tasks,
+            "events": events,
+            "owner_activity": owner_activity,
+            "question": question,
+        }
 
     def get_priority_followups(self, owner: str | None = None, limit: int = 12) -> list[dict[str, Any]]:
         with self._managed_connection() as conn:
@@ -642,12 +943,18 @@ class SalesAssistantService:
             or evidence.get("entity_hint")
         )
         recent_history = []
+        feedback_memory = []
         try:
             if user:
                 recent_history = fetch_history(limit=6, username=user.username)
+                feedback_memory = fetch_feedback_memory(question, username=user.username, limit=3)
+            else:
+                feedback_memory = fetch_feedback_memory(question, username=None, limit=3)
         except Exception:
             recent_history = []
+            feedback_memory = []
         evidence["recent_history"] = recent_history
+        evidence["feedback_memory"] = feedback_memory
         return EvidencePack(
             question=question,
             owner_scope=evidence.get("owner_scope"),
@@ -718,6 +1025,7 @@ class SalesAssistantService:
             "comparison_candidates",
             "ranked_accounts",
             "risk_profile",
+            "time_review",
         ]
         if any(evidence.get(key) for key in gpt_sensitive_structured_keys):
             return True
@@ -745,6 +1053,7 @@ class SalesAssistantService:
                 "owner_kpis",
                 "global_kpis",
                 "entity_kpis",
+                "time_review",
             ]
             if any(evidence.get(key) for key in simple_keys):
                 return True
@@ -771,6 +1080,7 @@ class SalesAssistantService:
             "latest_contacted",
             "last_interactions",
             "risk_profile",
+            "time_review",
         ]
         return any(evidence.get(key) for key in structured_keys)
 
@@ -788,6 +1098,9 @@ class SalesAssistantService:
     def _collect_evidence(self, question: str, intent: QuestionIntent, owner_scope: str | None = None) -> dict[str, Any]:
         entity_term = self._extract_entity_hint(question)
         normalized_question = self._normalize_search_text(question)
+        time_window = self._parse_time_window(question)
+        if self._looks_like_date_phrase(entity_term):
+            entity_term = None
         if owner_scope and "comercialmente" in normalized_question:
             entity_term = None
         evidence: dict[str, Any] = {
@@ -799,6 +1112,13 @@ class SalesAssistantService:
         with self._managed_connection() as conn:
             if owner_scope:
                 evidence["owner_scope"] = owner_scope
+            if time_window:
+                evidence["time_window"] = {
+                    "start_date": time_window.start_date.isoformat(),
+                    "end_date": time_window.end_date.isoformat(),
+                    "label": time_window.label,
+                    "granularity": time_window.granularity,
+                }
             if entity_term:
                 resolution = self._resolve_entity(conn, entity_term, owner_scope=owner_scope)
                 evidence["entity_resolution"] = {
@@ -828,7 +1148,16 @@ class SalesAssistantService:
                 token in normalized_question for token in ["cliente", "clientes", "prospecto", "prospectos", "cuenta", "cuentas", "lead", "leads"]
             )
 
-            if asks_for_rank and owner_scope:
+            if intent.asks_for_time_review and time_window:
+                evidence["time_review"] = self._time_window_overview(
+                    conn,
+                    time_window,
+                    question,
+                    owner_scope=owner_scope,
+                    entity_term=entity_term,
+                )
+                evidence["direct_answer"] = self._format_time_window_review(evidence["time_review"], question)
+            elif asks_for_rank and owner_scope:
                 limit = self._extract_rank_limit(normalized_question)
                 evidence["ranked_accounts"] = self._owner_ranked_accounts(conn, owner_scope, limit=limit)
                 evidence["direct_answer"] = self._format_owner_ranked_accounts(evidence["ranked_accounts"], owner_scope, limit)
@@ -1061,6 +1390,8 @@ class SalesAssistantService:
             r"que informacion tienes sobre\s+(.+?)(?:\?|$)",
             r"que informacion hay de\s+(.+?)(?:\?|$)",
             r"que informacion hay sobre\s+(.+?)(?:\?|$)",
+            r"que paso con\s+(.+?)(?:\s+el\s+\d|$)",
+            r"que hubo con\s+(.+?)(?:\s+el\s+\d|$)",
             r"que sabes de\s+(.+?)(?:\?|$)",
             r"que sabes sobre\s+(.+?)(?:\?|$)",
             r"hablame de\s+(.+?)(?:\?|$)",
@@ -1148,6 +1479,8 @@ class SalesAssistantService:
             "mes",
             "ese nombre",
         }:
+            return True
+        if self._looks_like_date_phrase(candidate):
             return True
         return any(
             candidate.startswith(prefix)
@@ -3485,6 +3818,115 @@ class SalesAssistantService:
             f"{snippet[:220]}"
         )
 
+    def _format_time_window_review(self, review: dict[str, Any], question: str) -> str:
+        window = review.get("window") or {}
+        interactions = review.get("interactions") or []
+        notes = review.get("notes") or []
+        tasks = review.get("tasks") or []
+        events = review.get("events") or []
+        owner_activity = review.get("owner_activity") or []
+        entity_label = review.get("entity_resolution") or review.get("entity_term")
+        owner_label = review.get("owner_scope")
+        normalized_question = self._normalize_search_text(question)
+
+        if not (interactions or notes or tasks or events):
+            scope_bits = []
+            if entity_label:
+                scope_bits.append(entity_label)
+            if owner_label:
+                scope_bits.append(owner_label)
+            scope_suffix = f" para {' / '.join(scope_bits)}" if scope_bits else ""
+            return (
+                f"No encontre actividad visible en el rango {window.get('label') or 'solicitado'}{scope_suffix}. "
+                "No veo notas, interacciones, tareas ni eventos dentro de esa ventana."
+            )
+
+        header = f"Resumen temporal de {window.get('label') or 'la ventana consultada'}"
+        if entity_label:
+            header += f" para {entity_label}"
+        elif owner_label:
+            header += f" para {owner_label}"
+
+        asks_for_people = any(token in normalized_question for token in ["quien agrego", "quien agregó", "quien hizo", "quien movio", "quien movió"])
+        asks_for_comments = any(token in normalized_question for token in ["comentario", "comentarios", "que dijeron", "que se dijo", "notas"])
+        asks_for_commitments = any(token in normalized_question for token in ["compromiso", "compromisos", "tarea", "tareas", "evento", "eventos"])
+
+        if asks_for_people:
+            lines = [header, ""]
+            lines.append("Personas que registraron movimiento:")
+            for row in owner_activity[:8]:
+                lines.append(f"- {row.get('owner_name') or 'Sin responsable'}: {row.get('total_items') or 0} movimientos")
+            return "\n".join(lines)
+
+        if asks_for_comments:
+            lines = [header, ""]
+            lines.append("Comentarios y notas visibles:")
+            for row in notes[:8]:
+                snippet = (row.get("content_text") or row.get("title") or "").replace("\n", " ").strip()
+                lines.append(
+                    f"- {row.get('created_time') or '-'} | {row.get('parent_name') or 'Sin cliente'} | {row.get('owner_name') or 'Sin responsable'} | {snippet[:220]}"
+                )
+            if not notes and interactions:
+                lines.append("No hubo notas escritas en esa ventana, pero si hubo estas interacciones:")
+                for row in interactions[:5]:
+                    lines.append(
+                        f"- {row.get('interaction_at') or '-'} | {row.get('related_name') or 'Sin nombre'} | {row.get('source_type') or '-'} | {(row.get('summary') or row.get('status') or '-')[:180]}"
+                    )
+            return "\n".join(lines)
+
+        if asks_for_commitments:
+            lines = [header, ""]
+            lines.append("Compromisos, tareas y eventos detectados:")
+            for row in tasks[:8]:
+                lines.append(
+                    f"- Tarea | {row.get('due_date') or row.get('created_time') or '-'} | {row.get('contact_name') or 'Sin contacto'} | {row.get('subject') or 'Sin asunto'} | {row.get('status') or 'Sin estatus'} | {row.get('owner_name') or 'Sin responsable'}"
+                )
+            for row in events[:8]:
+                lines.append(
+                    f"- Evento | {row.get('start_time') or row.get('created_time') or '-'} | {row.get('contact_name') or 'Sin contacto'} | {row.get('title') or 'Sin titulo'} | {row.get('owner_name') or 'Sin responsable'}"
+                )
+            if len(lines) == 2:
+                lines.append("No hubo tareas ni eventos en esa ventana.")
+            return "\n".join(lines)
+
+        lines = [header]
+        lines.append(
+            f"Movimientos detectados: {len(interactions)} interacciones, {len(notes)} notas, {len(tasks)} tareas y {len(events)} eventos."
+        )
+        if owner_activity:
+            top = ", ".join(
+                f"{row.get('owner_name') or 'Sin responsable'} ({row.get('total_items') or 0})"
+                for row in owner_activity[:4]
+            )
+            lines.append(f"Quien movio cosas en ese rango: {top}.")
+        if notes:
+            lines.append("")
+            lines.append("Comentarios relevantes:")
+            for row in notes[:4]:
+                snippet = (row.get("content_text") or row.get("title") or "").replace("\n", " ").strip()
+                lines.append(
+                    f"- {row.get('created_time') or '-'} | {row.get('parent_name') or 'Sin cliente'} | {row.get('owner_name') or 'Sin responsable'} | {snippet[:180]}"
+                )
+        if tasks or events:
+            lines.append("")
+            lines.append("Compromisos y agenda:")
+            for row in tasks[:4]:
+                lines.append(
+                    f"- Tarea | {row.get('due_date') or row.get('created_time') or '-'} | {row.get('contact_name') or 'Sin contacto'} | {row.get('subject') or 'Sin asunto'} | {row.get('status') or 'Sin estatus'}"
+                )
+            for row in events[:3]:
+                lines.append(
+                    f"- Evento | {row.get('start_time') or row.get('created_time') or '-'} | {row.get('contact_name') or 'Sin contacto'} | {row.get('title') or 'Sin titulo'}"
+                )
+        if interactions:
+            lines.append("")
+            lines.append("Interacciones visibles:")
+            for row in interactions[:5]:
+                lines.append(
+                    f"- {row.get('interaction_at') or '-'} | {row.get('related_name') or 'Sin nombre'} | {row.get('source_type') or '-'} | {(row.get('summary') or row.get('status') or '-')[:160]}"
+                )
+        return "\n".join(lines)
+
     def _format_today_call_list(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "No encontre clientes sugeridos para llamar hoy."
@@ -3692,6 +4134,18 @@ class SalesAssistantService:
                 )
             return "\n".join(snippets) if snippets else "- Sin historial reciente"
 
+        def serialize_feedback(rows: list[dict[str, Any]], limit: int = 3) -> str:
+            snippets = []
+            for row in rows[:limit]:
+                correction = (row.get("correction") or "").strip().replace("\n", " ")
+                if len(correction) > 220:
+                    correction = correction[:217] + "..."
+                question_text = (row.get("question") or "").strip()
+                snippets.append(
+                    f"- Pregunta similar: {question_text}\n  Correccion preferida: {correction or 'Sin correccion escrita'}"
+                )
+            return "\n".join(snippets) if snippets else "- Sin feedback relevante"
+
         task = pack.task
         instructions = [
             "Eres el asistente comercial del equipo Flotimatics.",
@@ -3730,6 +4184,7 @@ class SalesAssistantService:
 
         prompt_parts = [
             "\n".join(instructions),
+            f"Hoy es: {self._today().isoformat()}",
             f"Pregunta: {question}",
             f"Tipo de tarea interpretado: {task.task_type}",
             f"Formato deseado: {task.desired_format}",
@@ -3739,6 +4194,7 @@ class SalesAssistantService:
             f"Entidad detectada: {pack.entity_hint}",
             f"Entidad canonica: {pack.entity_name}",
             "Historial reciente del usuario:\n" + serialize_history(evidence.get("recent_history", [])),
+            "Feedback historico relevante:\n" + serialize_feedback(evidence.get("feedback_memory", [])),
             f"Resumen cliente: {evidence.get('entity_brief')}",
             f"Resumen vendedor: {evidence.get('owner_brief')}",
             f"Resumen equipo: {evidence.get('team_brief')}",
@@ -3761,6 +4217,8 @@ class SalesAssistantService:
             f"KPIs owner: {evidence.get('owner_kpis')}",
             f"KPIs globales: {evidence.get('global_kpis')}",
             f"KPIs entidad: {evidence.get('entity_kpis')}",
+            f"Ventana temporal: {evidence.get('time_window')}",
+            f"Resumen temporal: {evidence.get('time_review')}",
             "Fragmentos de documentos:\n" + serialize_rows(evidence.get("document_chunks", [])),
         ]
         direct_answer = evidence.get("direct_answer")
@@ -3769,4 +4227,8 @@ class SalesAssistantService:
         prompt_parts.append(
             "Regla final: responde la intencion real del usuario. Si la mejor respuesta es una sintesis comercial integrada, hazla. Si el usuario pidio una pieza lista para usar, entrégala completa."
         )
+        if evidence.get("feedback_memory"):
+            prompt_parts.append(
+                "Si el feedback historico muestra una correccion valida para una pregunta muy parecida, priorizala sobre estilos previos del sistema, siempre sin inventar datos fuera de la evidencia actual."
+            )
         return "\n\n".join(prompt_parts)
