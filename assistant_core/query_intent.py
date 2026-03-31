@@ -111,6 +111,12 @@ def classify_question(question: str) -> QuestionIntent:
             "que tres clientes debo atacar primero esta semana",
             "si fueras yo",
             "si fueras director comercial",
+            "que hacer con",
+            "que hago con",
+            "que deberia hacer con",
+            "que deberia hacer manana con",
+            "que debería hacer con",
+            "que debería hacer mañana con",
         ]
     )
     asks_for_sales_material = any(
@@ -273,7 +279,26 @@ def classify_question(question: str) -> QuestionIntent:
         or ("en base a mis notas" in q and any(token in q for token in ["llamar", "contactar", "seguimiento"]))
     )
     asks_for_comparison = any(token in q for token in ["compara", "comparativa", " vs ", "diferencia entre", "diferencias entre"])
-    wants_web = any(token in q for token in ["web", "internet"])
+    web_markers = [
+        "web",
+        "internet",
+        "en linea",
+        "en linea",
+        "online",
+        "fuentes externas",
+        "fuentes publicas",
+        "fuentes publicas",
+        "busca en la web",
+        "busca en internet",
+        "investiga en internet",
+        "investiga en la web",
+        "afuera del crm",
+        "fuera del crm",
+        "ademas busca afuera",
+        "ademas busca en internet",
+        "ademas busca en la web",
+    ]
+    wants_web = any(token in q for token in web_markers)
     asks_for_yesterday_contacts = "ayer" in q and any(token in q for token in ["hable", "llame", "contacte"])
     asks_for_day_before_yesterday_contacts = any(token in q for token in ["antier", "anteayer"]) and any(token in q for token in ["hable", "llame", "contacte"])
     asks_for_latest_contacted = any(token in q for token in ["ultimo cliente", "cliente que se contacto a lo ultimo"])

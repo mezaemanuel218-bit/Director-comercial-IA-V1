@@ -75,10 +75,13 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
 
     base_self_questions = [
         {"username": "emeza", "question": "dame todo lo que debo saber de mis contactos o leads"},
+        {"username": "emeza", "question": "dame todo lo que debo saber de Hieleria Veracruz"},
         {"username": "emeza", "question": "kpi mio de la semana"},
         {"username": "emeza", "question": "dame clientes calientes y clientes frios"},
         {"username": "emeza", "question": "a quien debo llamar hoy y por que"},
         {"username": "emeza", "question": "a quien debo contactar hoy"},
+        {"username": "emeza", "question": "Dame contactos y dime que hacer con tum mañana"},
+        {"username": "emeza", "question": "dime que compromisos detectas pendiente o por confirmar que si realice?"},
         {"username": "emeza", "question": "en base a mis notas a quien me recomiendas llamar hoy"},
         {"username": "emeza", "question": "ultima nota agregada"},
         {"username": "emeza", "question": "compromisos pendientes para hoy"},
@@ -187,6 +190,14 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
         {"username": "emeza", "question": "dame la respuesta como plan de accion sobre mi cartera"},
         {"username": "emeza", "question": "dame solo recomendacion y riesgos de mi cartera"},
         {"username": "emeza", "question": "dame primero conclusion y luego evidencia sobre mi cartera"},
+        {
+            "username": "emeza",
+            "question": "Analiza esta nota y dime resumen, riesgos y siguiente paso:\nSe realizo visita presencial con Federico de Hieleria Veracruz. Comenta que tienen interes en una demo, pero hoy siguen usando otro sistema y no estan convencidos de cambiar todavia. Quedamos en coordinar la demo por whatsapp la proxima semana.",
+        },
+        {
+            "username": "emeza",
+            "question": "Lee este correo y dime que respondo:\nHola Emmanuel, gracias por la informacion. Ahorita seguimos con el proveedor actual y no tenemos urgencia, pero me interesa revisar una demo en abril si me mandas opciones. Quedo atento.",
+        },
     ]
     questions.extend(formatting_questions)
 

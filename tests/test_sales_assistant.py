@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from assistant_core.auth import get_user
 from assistant_core.history import ensure_history_schema, fetch_feedback, fetch_feedback_memory, fetch_history, save_feedback, save_history
@@ -89,6 +90,27 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("servicios y minas de mexico actus", answer)
         self.assertNotIn("no hay registros en zoho crm ni pdfs locales sobre hieleria veracruz", answer)
 
+    def test_todo_lo_que_debo_saber_de_hieleria_uses_real_crm_evidence(self) -> None:
+        response = self.service.answer_question("dame todo lo que debo saber de Hieleria Veracruz", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("hieleria veracruz", answer)
+        self.assertTrue("federico" in answer or "demo" in answer or "visita" in answer)
+        self.assertNotIn("no contamos con datos previos", answer)
+
+    def test_compound_contacts_and_tomorrow_plan_keeps_tum_scope(self) -> None:
+        response = self.service.answer_question("Dame contactos y dime que hacer con tum mañana", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("tum", answer)
+        self.assertNotIn("no hay registros en crm", answer)
+        self.assertNotIn("no puedo entregarte datos de contacto", answer)
+
+    def test_pending_commitments_that_i_completed_scope_to_active_seller(self) -> None:
+        response = self.service.answer_question("dime que compromisos detectas pendiente o por confirmar que si realice?", user=self.emeza)
+        answer = response.answer.lower()
+        self.assertIn("jesus emmanuel meza", answer)
+        self.assertNotIn("soporte flotimatics", answer)
+        self.assertNotIn("eduardo valdez", answer)
+
     def test_kpis_for_emmanuel_are_not_zero(self) -> None:
         response = self.service.answer_question("mis kpis", user=self.emeza)
         answer = response.answer.lower()
@@ -127,6 +149,10 @@ class SalesAssistantServiceTests(unittest.TestCase):
         )
         self.assertTrue(intent.asks_for_sales_draft)
 
+    def test_explicit_web_query_should_be_detected(self) -> None:
+        intent = classify_question("segun la web y fuentes externas, que sabes de geotab hoy")
+        self.assertTrue(intent.wants_web)
+
     def test_sales_email_draft_formatter_uses_context(self) -> None:
         draft = self.service._sales_draft(
             "dame un correo electronico para mandarle a movimex",
@@ -144,6 +170,42 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("movimex", answer)
         self.assertIn("asunto:", answer)
         self.assertIn("dena.salinas@movimex.com", answer)
+
+    def test_embedded_text_analysis_returns_summary_risks_and_next_step(self) -> None:
+        response = self.service.answer_question(
+            "Analiza esta nota y dime resumen, riesgos y siguiente paso:\n"
+            "Se realizo visita presencial con Federico de Hieleria Veracruz. Comenta que tienen interes en una demo, "
+            "pero hoy siguen usando otro sistema y no estan convencidos de cambiar todavia. "
+            "Quedamos en coordinar la demo por whatsapp la proxima semana."
+        )
+        answer = response.answer.lower()
+        self.assertIn("en corto:", answer)
+        self.assertIn("riesgos detectados", answer)
+        self.assertIn("siguiente paso recomendado", answer)
+        self.assertIn("demo", answer)
+
+    def test_embedded_text_with_reply_request_returns_ready_piece(self) -> None:
+        response = self.service.answer_question(
+            "Lee este correo y dime que respondo:\n"
+            "Hola Emmanuel, gracias por la informacion. Ahorita seguimos con el proveedor actual y no tenemos urgencia, "
+            "pero me interesa revisar una demo en abril si me mandas opciones. Quedo atento."
+        )
+        answer = response.answer.lower()
+        self.assertIn("pieza lista:", answer)
+        self.assertIn("siguiente paso recomendado", answer)
+        self.assertIn("demo", answer)
+
+    def test_embedded_text_question_bypasses_split_and_keeps_context(self) -> None:
+        response = self.service.answer_question(
+            "Analiza este texto y dime que paso, que riesgo ves y que siguiente paso recomiendas:\n"
+            "Se envio propuesta el lunes 18 de marzo de 2026. El cliente comenta que ya tiene proveedor actual, "
+            "pero que si le interesa comparar una prueba pequena. Pide que le marquemos el jueves para confirmar."
+        )
+        answer = response.answer.lower()
+        self.assertIn("en corto:", answer)
+        self.assertIn("riesgos detectados", answer)
+        self.assertIn("fecha:", answer)
+        self.assertIn("siguiente paso recomendado", answer)
 
     def test_owner_comparison_returns_metrics_for_both_sellers(self) -> None:
         response = self.service.answer_question("diferencias entre emmanuel y pablo melin")
@@ -300,6 +362,42 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("fuentes internas consultadas", answer)
         self.assertIn("geotab", answer)
 
+    def test_explicit_web_question_marks_response_and_appends_sources(self) -> None:
+        service = SalesAssistantService(db_path=self.service.db_path)
+
+        class FakeResponsesAPI:
+            def create(self, **kwargs):
+                annotation = SimpleNamespace(
+                    type="url_citation",
+                    title="Geotab official newsroom",
+                    url="https://example.com/geotab-news",
+                )
+                content = SimpleNamespace(annotations=[annotation])
+                message = SimpleNamespace(type="message", content=[content])
+                return SimpleNamespace(
+                    output_text="En la web hay referencias recientes a seguridad y eficiencia operativa en Geotab.",
+                    output=[message],
+                    sources=[SimpleNamespace(title="Geotab official newsroom", url="https://example.com/geotab-news")],
+                )
+
+        class FakeChatCompletions:
+            def create(self, **kwargs):
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="En corto: internamente hay soporte documental y, como complemento, la web aporta contexto externo reciente."))]
+                )
+
+        service.client = SimpleNamespace(
+            responses=FakeResponsesAPI(),
+            chat=SimpleNamespace(completions=FakeChatCompletions()),
+        )
+
+        response = service.answer_question("segun la web y los documentos internos, que dice geotab sobre seguridad")
+        answer = response.answer.lower()
+        self.assertTrue(response.used_web)
+        self.assertIn("fuentes web consultadas", answer)
+        self.assertIn("https://example.com/geotab-news", answer)
+        self.assertTrue(any(source.startswith("web:") for source in response.sources))
+
     def test_time_window_parser_supports_specific_day(self) -> None:
         window = self.service._parse_time_window("que paso el 19 de marzo de 2026")
         self.assertIsNotNone(window)
@@ -406,6 +504,17 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertTrue("panorama:" in answer or "resumen ejecutivo de movimex" in answer)
         self.assertTrue("riesgos y bloqueadores:" in answer or "riesgos detectados" in answer)
         self.assertTrue("recomendacion:" in answer or "siguiente paso recomendado:" in answer)
+
+    def test_ceo_style_team_question_splits_kpis_and_priority(self) -> None:
+        response = self.service.answer_question(
+            "dame un resumen ejecutivo del equipo comercial, kpi global de la semana de todos los vendedores y a quien deberiamos empujar primero",
+            user=get_user("evaldez"),
+        )
+        answer = response.answer.lower()
+        self.assertIn("equipo", answer)
+        self.assertTrue("panorama:" in answer or "resumen ejecutivo del equipo" in answer)
+        self.assertTrue("indicadores:" in answer or "kpis globales" in answer or "interacciones:" in answer)
+        self.assertTrue("recomendacion:" in answer or "decision sugerida" in answer)
 
     def test_free_minutes_work_plan_should_not_jump_to_random_account(self) -> None:
         response = self.service.answer_question("tengo 30 min libres, hazme un plan de trabajo", user=self.emeza)

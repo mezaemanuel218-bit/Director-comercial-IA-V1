@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -106,18 +107,31 @@ class SalesAssistantService:
         self.client = OpenAI(api_key=api_key) if api_key else None
 
     def answer_question(self, question: str, user: AppUser | None = None) -> AssistantResponse:
+        if self._extract_embedded_text(question):
+            return self._answer_single_question(question, user=user)
         subquestions = self._semantic_split_question(question, user=user) or self._split_compound_question(question)
         if len(subquestions) > 1:
             subquestions = self._contextualize_subquestions(question, subquestions, user=user)
             subresponses = [self._answer_single_question(subquestion, user=user) for subquestion in subquestions]
             combined_answer = self._combine_subresponses(question, subquestions, subresponses)
             combined_sources = sorted({source for response in subresponses for source in response.sources})
+            combined_evidence: dict[str, Any] = {"subquestions": subquestions, "subresponses": [response.evidence for response in subresponses]}
+            combined_doc_chunks: list[dict[str, Any]] = []
+            combined_web_sources: list[dict[str, str]] = []
+            for response in subresponses:
+                combined_doc_chunks.extend(response.evidence.get("document_chunks") or [])
+                combined_web_sources.extend((response.evidence.get("web_result") or {}).get("sources") or [])
+            if combined_doc_chunks:
+                combined_evidence["document_chunks"] = combined_doc_chunks
+            if combined_web_sources:
+                combined_evidence["web_result"] = {"sources": combined_web_sources}
+            combined_answer = self._finalize_answer(combined_answer, question, combined_evidence)
             return AssistantResponse(
                 mode="hybrid",
                 sources=combined_sources,
-                used_web=False,
+                used_web=any(response.used_web for response in subresponses),
                 answer=combined_answer,
-                evidence={"subquestions": subquestions, "subresponses": [response.evidence for response in subresponses]},
+                evidence=combined_evidence,
             )
         return self._answer_single_question(question, user=user)
 
@@ -137,21 +151,26 @@ class SalesAssistantService:
             "response_style": pack.task.response_style,
             "depth": pack.task.depth,
         }
+        used_web = bool(evidence.get("web_result"))
         feedback_override = self._feedback_override(evidence)
         if feedback_override:
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
-                used_web=False,
+                used_web=used_web,
                 answer=feedback_override,
                 evidence=evidence,
             )
 
-        if evidence.get("direct_answer") and self._should_prefer_direct_answer(intent, evidence, task):
+        if (
+            evidence.get("direct_answer")
+            and self._should_prefer_direct_answer(intent, evidence, task)
+            and not (used_web and self.client)
+        ):
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
-                used_web=False,
+                used_web=used_web,
                 answer=self._compose_fallback_answer(pack),
                 evidence=evidence,
             )
@@ -161,7 +180,7 @@ class SalesAssistantService:
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
-                used_web=False,
+                used_web=used_web,
                 answer=fallback,
                 evidence=evidence,
             )
@@ -179,7 +198,7 @@ class SalesAssistantService:
         return AssistantResponse(
             mode=intent.mode,
             sources=evidence["sources"],
-            used_web=False,
+            used_web=used_web,
             answer=answer,
             evidence=evidence,
         )
@@ -195,6 +214,208 @@ class SalesAssistantService:
             return None
         return correction
 
+    def _extract_embedded_text(self, question: str) -> dict[str, str] | None:
+        raw = (question or "").strip()
+        if len(raw) < 120:
+            return None
+        lowered = raw.lower()
+        markers = [
+            "texto:",
+            "nota:",
+            "correo:",
+            "mensaje:",
+            "comentario:",
+            "transcripcion:",
+            "transcripción:",
+        ]
+        for marker in markers:
+            index = lowered.find(marker)
+            if index >= 0:
+                instruction = raw[:index].strip(" \n\t:;-")
+                content = raw[index + len(marker):].strip()
+                if len(content) >= 80:
+                    return {"instruction": instruction or "analiza este texto", "content": content}
+        if "\n" in raw:
+            first_line, body = raw.split("\n", 1)
+            normalized_first = self._normalize_search_text(first_line)
+            if len(body.strip()) >= 120 and any(
+                token in normalized_first
+                for token in [
+                    "analiza",
+                    "interpreta",
+                    "resume",
+                    "resumen",
+                    "texto",
+                    "nota",
+                    "correo",
+                    "mensaje",
+                    "comentario",
+                    "transcripcion",
+                    "transcripcion",
+                    "que respondo",
+                    "que ves",
+                    "que hago",
+                    "siguiente paso",
+                ]
+            ):
+                return {"instruction": first_line.strip(), "content": body.strip()}
+        return None
+
+    def _text_sentences(self, text: str) -> list[str]:
+        cleaned = re.sub(r"\s+", " ", strip_html(text or "")).strip()
+        if not cleaned:
+            return []
+        return [chunk.strip(" -") for chunk in re.split(r"(?<=[\.\?!])\s+|\n+", cleaned) if chunk.strip(" -")]
+
+    def _embedded_text_analysis(self, question: str, content: str) -> dict[str, Any]:
+        normalized_question = self._normalize_search_text(question)
+        sentences = self._text_sentences(content)
+        dates = re.findall(
+            r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b\d{1,2}\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)(?:\s+de\s+\d{4})?\b",
+            self._normalize_search_text(content),
+        )
+        emails = [self._clean_email(match.group(0)) for match in EMAIL_RE.finditer(content)]
+        phones = [self._clean_phone(match.group(0)) for match in PHONE_RE.finditer(content)]
+
+        positive_markers = {
+            "interes": "Hay señal de interés explícita.",
+            "demo": "Se menciona demo o apertura a demostración.",
+            "prueba": "Se menciona prueba o piloto.",
+            "reunion": "Hay reunión o espacio de seguimiento mencionado.",
+            "cotiz": "Hay referencia a cotización o propuesta.",
+            "propuesta": "Hay propuesta comercial en conversación.",
+            "agenda": "Hay intención de agenda o siguiente contacto.",
+            "visita": "Hubo visita o acercamiento presencial.",
+        }
+        risk_markers = {
+            "no cree": "La cuenta expresó resistencia o duda frente al cambio.",
+            "no estan convencidos": "La cuenta todavía no está convencida de cambiar.",
+            "no están convencidos": "La cuenta todavía no está convencida de cambiar.",
+            "ya no los moleste": "Hay rechazo explícito al seguimiento.",
+            "no estan interesados": "Se reporta falta de interés.",
+            "no están interesados": "Se reporta falta de interés.",
+            "ya cuentan": "La cuenta ya tiene proveedor o solución actual.",
+            "ya tienen": "La cuenta ya tiene proveedor o solución actual.",
+            "otro sistema": "La cuenta ya opera con otro sistema y habrá que diferenciar valor.",
+            "rebot": "Hay correo rebotado o dato de contacto por depurar.",
+            "sin respuesta": "No hay respuesta confirmada todavía.",
+            "muy ocupado": "El timing del cliente sigue bloqueando avance.",
+            "lo revisaran": "La decisión sigue en espera de validación interna.",
+            "lo revisarán": "La decisión sigue en espera de validación interna.",
+            "despues": "El seguimiento se difirió a otro momento.",
+            "después": "El seguimiento se difirió a otro momento.",
+            "contrato": "Puede existir contrato vigente con otro proveedor.",
+            "proveedor actual": "Hay proveedor actual compitiendo contra la propuesta.",
+        }
+        commitment_markers = [
+            "agendar",
+            "agenda",
+            "enviar",
+            "mandar",
+            "llamar",
+            "marcar",
+            "visita",
+            "demo",
+            "seguimiento",
+            "reunion",
+            "reunión",
+            "propuesta",
+            "cotizacion",
+            "cotización",
+            "confirmar",
+            "responder",
+        ]
+
+        normalized_text = self._normalize_search_text(content)
+        positives = [label for marker, label in positive_markers.items() if marker in normalized_text]
+        risks = [label for marker, label in risk_markers.items() if marker in normalized_text]
+        commitments = [
+            sentence
+            for sentence in sentences
+            if any(marker in self._normalize_search_text(sentence) for marker in commitment_markers)
+        ]
+
+        summary_sentences = sentences[:2] if sentences else []
+        summary = " ".join(summary_sentences)[:320] if summary_sentences else "No se pudo resumir el texto con claridad."
+
+        asks_for_reply = any(
+            token in normalized_question
+            for token in ["que respondo", "que contesto", "redacta respuesta", "redactame respuesta", "respuesta corta", "respuesta breve", "que le digo"]
+        )
+        asks_for_risks = any(token in normalized_question for token in ["riesgo", "riesgos", "objecion", "objeciones", "bloqueador"])
+        asks_for_plan = any(token in normalized_question for token in ["siguiente paso", "que hago", "que hacer", "recomienda", "recomendarias", "plan"])
+
+        next_step = "Pedir un siguiente paso concreto con fecha, responsable y objetivo."
+        if any("demo" in self._normalize_search_text(sentence) for sentence in commitments + sentences):
+            next_step = "Asegurar fecha de demo y confirmar quiénes deben estar en la llamada."
+        elif any("cotiz" in self._normalize_search_text(sentence) or "propuesta" in self._normalize_search_text(sentence) for sentence in commitments + sentences):
+            next_step = "Dar seguimiento a la propuesta con una llamada breve para resolver objeciones y cerrar fecha de revisión."
+        elif any("llamar" in self._normalize_search_text(sentence) or "marcar" in self._normalize_search_text(sentence) for sentence in commitments + sentences):
+            next_step = "Convertir el seguimiento en llamada con fecha y registrar el resultado en CRM."
+        if any("ya tienen" in self._normalize_search_text(risk) or "proveedor" in self._normalize_search_text(risk) for risk in risks):
+            next_step = "Entrar por diferenciador claro, no por catálogo; validar dolor actual y proponer prueba pequeña o comparación puntual."
+
+        reply = None
+        if asks_for_reply:
+            reply_lines = [
+                "Hola, gracias por el contexto.",
+                "Retomando lo que comentas, creo que vale la pena aterrizar el siguiente paso de forma muy concreta para no perder avance.",
+                f"Mi propuesta es {next_step.lower()}",
+                "Si te hace sentido, hoy mismo definimos fecha y participantes.",
+                "Quedo atento.",
+            ]
+            reply = " ".join(reply_lines)
+
+        return {
+            "summary": summary,
+            "dates": list(dict.fromkeys(dates))[:6],
+            "emails": list(dict.fromkeys(emails))[:6],
+            "phones": list(dict.fromkeys(phones))[:6],
+            "positive_signals": positives[:6],
+            "risks": risks[:6] if asks_for_risks or risks else [],
+            "commitments": commitments[:5],
+            "next_step": next_step,
+            "reply": reply,
+            "asks_for_plan": asks_for_plan,
+        }
+
+    def _format_embedded_text_analysis(self, analysis: dict[str, Any]) -> str:
+        lines = [f"En corto: {analysis.get('summary') or 'No detecte un resumen claro en el texto.'}"]
+        positives = analysis.get("positive_signals") or []
+        risks = analysis.get("risks") or []
+        commitments = analysis.get("commitments") or []
+        if positives:
+            lines.append("")
+            lines.append("Lectura actual:")
+            for item in positives[:4]:
+                lines.append(f"- {item}")
+        if risks:
+            lines.append("")
+            lines.append("Riesgos detectados:")
+            for item in risks[:4]:
+                lines.append(f"- {item}")
+        if commitments:
+            lines.append("")
+            lines.append("Compromisos o señales de siguiente paso en el texto:")
+            for item in commitments[:3]:
+                lines.append(f"- {item[:220]}")
+        if analysis.get("dates") or analysis.get("emails") or analysis.get("phones"):
+            lines.append("")
+            lines.append("Datos puntuales detectados:")
+            for item in (analysis.get("dates") or [])[:3]:
+                lines.append(f"- Fecha: {item}")
+            for item in (analysis.get("emails") or [])[:3]:
+                lines.append(f"- Correo: {item}")
+            for item in (analysis.get("phones") or [])[:3]:
+                lines.append(f"- Telefono: {item}")
+        lines.append("")
+        lines.append(f"Siguiente paso recomendado: {analysis.get('next_step') or 'Registrar la evidencia y definir siguiente contacto.'}")
+        if analysis.get("reply"):
+            lines.append("")
+            lines.append("Pieza lista:")
+            lines.append(analysis["reply"])
+        return "\n".join(lines)
+
     def _finalize_answer(self, answer: str, question: str, evidence: dict[str, Any]) -> str:
         final_answer = (answer or "").strip()
         if not final_answer:
@@ -207,7 +428,126 @@ class SalesAssistantService:
                 )
                 if citations:
                     final_answer += f"\n\nFuentes internas consultadas: {citations}"
+        if evidence.get("web_result"):
+            normalized = self._normalize_search_text(final_answer)
+            if "fuentes web consultadas" not in normalized:
+                web_lines = self._format_web_sources(evidence["web_result"].get("sources") or [])
+                if web_lines:
+                    final_answer += "\n\nFuentes web consultadas:\n" + "\n".join(web_lines)
         return final_answer
+
+    def _should_use_web(self, question: str, intent: QuestionIntent) -> bool:
+        normalized = self._normalize_search_text(question)
+        explicit_markers = [
+            "web",
+            "internet",
+            "online",
+            "en linea",
+            "fuentes externas",
+            "fuentes publicas",
+            "busca en la web",
+            "busca en internet",
+            "investiga en la web",
+            "investiga en internet",
+            "afuera del crm",
+            "fuera del crm",
+        ]
+        return intent.wants_web or any(marker in normalized for marker in explicit_markers)
+
+    def _web_source_labels(self, sources: list[dict[str, str]]) -> list[str]:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for source in sources:
+            title = (source.get("title") or "").strip()
+            url = (source.get("url") or "").strip()
+            if title:
+                label = f"web: {title[:80]}"
+            elif url:
+                label = f"web: {(urlparse(url).netloc or url)[:80]}"
+            else:
+                continue
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+        return labels
+
+    def _format_web_sources(self, sources: list[dict[str, str]]) -> list[str]:
+        lines: list[str] = []
+        seen: set[str] = set()
+        for source in sources:
+            url = (source.get("url") or "").strip()
+            title = (source.get("title") or "").strip() or (urlparse(url).netloc if url else "fuente web")
+            key = url or title
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if url:
+                lines.append(f"- {title} | {url}")
+            else:
+                lines.append(f"- {title}")
+        return lines
+
+    def _extract_web_sources_from_response(self, response: Any) -> list[dict[str, str]]:
+        def get_value(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        extracted: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        def push(title: str | None, url: str | None) -> None:
+            clean_title = (title or "").strip()
+            clean_url = (url or "").strip()
+            key = clean_url or clean_title
+            if not key or key in seen:
+                return
+            seen.add(key)
+            extracted.append({"title": clean_title, "url": clean_url})
+
+        for source in get_value(response, "sources", []) or []:
+            push(get_value(source, "title"), get_value(source, "url"))
+
+        for item in get_value(response, "output", []) or []:
+            if get_value(item, "type") != "message":
+                continue
+            for content in get_value(item, "content", []) or []:
+                for annotation in get_value(content, "annotations", []) or []:
+                    if get_value(annotation, "type") != "url_citation":
+                        continue
+                    push(get_value(annotation, "title"), get_value(annotation, "url"))
+
+        return extracted
+
+    def _web_search_summary(self, question: str) -> dict[str, Any] | None:
+        if not self.client or not hasattr(self.client, "responses"):
+            return None
+        web_model = (os.getenv("OPENAI_WEB_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+        prompt = (
+            "Busca en la web solo lo necesario para complementar esta pregunta comercial.\n"
+            "Responde en espanol con un resumen factual y breve.\n"
+            "Usa fechas absolutas cuando aplique.\n"
+            "No mezcles esta informacion como si fuera CRM interno.\n"
+            f"Pregunta: {question}"
+        )
+        try:
+            response = self.client.responses.create(
+                model=web_model,
+                tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
+                input=prompt,
+            )
+        except Exception:
+            return None
+
+        summary = (getattr(response, "output_text", None) or "").strip()
+        sources = self._extract_web_sources_from_response(response)
+        if not summary and not sources:
+            return None
+        return {
+            "summary": summary,
+            "sources": sources[:6],
+            "model": web_model,
+        }
 
     def _today(self) -> date:
         return datetime.now().date()
@@ -818,7 +1158,7 @@ class SalesAssistantService:
             return [question]
         question_parts = [
             part.strip(" ,.;:-")
-            for part in re.split(r"\?\s+(?=(?:que|cuantos|cuantas|como|dame|hazme|analiza|resume|redacta|escribe)\b)", question.strip(), flags=re.IGNORECASE)
+            for part in re.split(r"\?\s+(?=(?:que|cuantos|cuantas|como|dame|dime|hazme|analiza|resume|resumen|redacta|escribe|kpi|kpis)\b)", question.strip(), flags=re.IGNORECASE)
             if part and part.strip(" ,.;:-")
         ]
         if len(question_parts) > 1:
@@ -836,8 +1176,8 @@ class SalesAssistantService:
     def _fallback_semantic_like_split(self, question: str) -> list[str]:
         candidate = question.strip()
         patterns = [
-            r"\s*,\s*(?=(?:que|quien|cual|como|dame|hazme|analiza|resume|redacta|escribe|armame)\b)",
-            r"\s+(?:y|e)\s+(?=(?:que|quien|cual|como|dame|hazme|analiza|resume|redacta|escribe|armame)\b)",
+            r"\s*,\s*(?=(?:que|quien|cual|como|dame|dime|hazme|analiza|resume|resumen|redacta|escribe|armame|kpi|kpis)\b)",
+            r"\s+(?:y|e)\s+(?=(?:que|quien|cual|como|dame|dime|hazme|analiza|resume|resumen|redacta|escribe|armame|kpi|kpis)\b)",
         ]
         for pattern in patterns:
             parts = [
@@ -870,7 +1210,7 @@ class SalesAssistantService:
             "si hoy ",
             "si solo ",
         ]
-        actionable_markers = ["que ", "quien ", "cual ", "como ", "dame ", "hazme ", "analiza ", "resume ", "redacta ", "escribe ", "armame "]
+        actionable_markers = ["que ", "quien ", "cual ", "como ", "dame ", "dime ", "hazme ", "analiza ", "resume ", "resumen ", "redacta ", "escribe ", "armame ", "kpi ", "kpis "]
         if any(normalized_first.startswith(marker) for marker in intro_markers) and not any(
             normalized_first.startswith(marker) for marker in actionable_markers
         ):
@@ -884,7 +1224,7 @@ class SalesAssistantService:
             nested = [
                 item.strip(" ,.;:-")
                 for item in re.split(
-                    r"\s+(?:y|e)\s+(?=(?:que|quien|cual|como|dame|hazme|analiza|resume|redacta|escribe|armame)\b)",
+                    r"\s+(?:y|e)\s+(?=(?:que|quien|cual|como|dame|dime|hazme|analiza|resume|resumen|redacta|escribe|armame|kpi|kpis)\b)",
                     part,
                     flags=re.IGNORECASE,
                 )
@@ -1112,6 +1452,9 @@ class SalesAssistantService:
                 if rewritten.lower().startswith("mensaje para") or rewritten.lower().startswith("un mensaje para"):
                     rewritten = f"armame {rewritten}"
                 contextualized.append(f"{rewritten} para {carried}" if f"para {carried}".lower() not in rewritten.lower() else rewritten)
+            elif any(token in normalized for token in ["contacto", "contactos", "nombre", "nombres", "telefono", "telefonos", "numero", "numeros", "correo", "correos"]):
+                rewritten = subquestion.strip()
+                contextualized.append(f"{rewritten} de {carried}" if f" de {carried}".lower() not in rewritten.lower() else rewritten)
             elif any(token in normalized for token in ["ese nombre", "esa cuenta", "ese cliente", "ese prospecto", "para el", "para ella"]):
                 rewritten = subquestion.strip()
                 for marker in ["ese nombre", "esa cuenta", "ese cliente", "ese prospecto", "para el", "para ella"]:
@@ -1571,6 +1914,7 @@ class SalesAssistantService:
             "team_brief",
             "action_plan",
             "entity_brief",
+            "embedded_analysis",
             "sales_draft",
             "sales_material",
             "today_call_list",
@@ -1605,6 +1949,7 @@ class SalesAssistantService:
                 "owner_kpis",
                 "global_kpis",
                 "entity_kpis",
+                "embedded_analysis",
                 "time_review",
                 "topic_mention",
                 "time_gap_summary",
@@ -1619,6 +1964,7 @@ class SalesAssistantService:
             "sales_draft",
             "action_plan",
             "sales_material",
+            "embedded_analysis",
             "today_call_list",
             "comparison_candidates",
             "owner_comparison",
@@ -1657,6 +2003,7 @@ class SalesAssistantService:
         entity_term = self._extract_entity_hint(question)
         normalized_question = self._normalize_search_text(question)
         time_window = self._parse_time_window(question)
+        embedded_text = self._extract_embedded_text(question)
         if self._looks_like_date_phrase(entity_term):
             entity_term = None
         if owner_scope and "comercialmente" in normalized_question:
@@ -1668,6 +2015,10 @@ class SalesAssistantService:
         }
 
         with self._managed_connection() as conn:
+            if embedded_text:
+                evidence["embedded_text"] = embedded_text
+                evidence["embedded_analysis"] = self._embedded_text_analysis(question, embedded_text["content"])
+                evidence["direct_answer"] = self._format_embedded_text_analysis(evidence["embedded_analysis"])
             if owner_scope:
                 evidence["owner_scope"] = owner_scope
             if time_window:
@@ -1708,7 +2059,9 @@ class SalesAssistantService:
                 token in normalized_question for token in ["cliente", "clientes", "prospecto", "prospectos", "cuenta", "cuentas", "lead", "leads"]
             )
 
-            if intent.asks_for_time_review and time_window:
+            if evidence.get("embedded_analysis"):
+                pass
+            elif intent.asks_for_time_review and time_window:
                 evidence["time_review"] = self._time_window_overview(
                     conn,
                     time_window,
@@ -1899,6 +2252,12 @@ class SalesAssistantService:
                 ):
                     evidence["document_summary"] = self._document_summary(question, evidence["document_chunks"])
                     evidence["direct_answer"] = self._format_document_summary(evidence["document_summary"])
+        if self._should_use_web(question, intent):
+            evidence["web_result"] = self._web_search_summary(question)
+            if evidence.get("web_result"):
+                evidence["sources"].extend(self._web_source_labels(evidence["web_result"].get("sources") or []))
+                if not evidence.get("direct_answer"):
+                    evidence["direct_answer"] = evidence["web_result"].get("summary") or "No encontre soporte web util."
 
         return evidence
 
@@ -1951,6 +2310,7 @@ class SalesAssistantService:
             r"(?:correo|mail|email|mensaje)\s+(?:para|a)\s+(.+?)(?:,|$)",
             r"(?:seguimiento|correo|mensaje|propuesta)\s+para\s+(.+?)(?:,|$)",
             r"(?:llamada|reunion|reunion)\s+con\s+(.+?)(?:,|$)",
+            r"(?:que hacer|que hago|que deberia hacer|que debería hacer)\s+con\s+(.+?)(?:\s+manana|\s+mañana|,|$)",
             r"(?:esta semana|hoy|manana|mañana)\s+con\s+(.+?)(?:,|$)",
         ]
         for pattern in sales_patterns:
@@ -1968,6 +2328,8 @@ class SalesAssistantService:
             r"que me dices de\s+(.+?)(?:\?|$)",
             r"que me puedes decir de\s+(.+?)(?:\?|$)",
             r"que me puedes decir sobre\s+(.+?)(?:\?|$)",
+            r"dame todo lo que debo saber de\s+(.+?)(?:\?|$)",
+            r"dame todo lo que debo saber sobre\s+(.+?)(?:\?|$)",
             r"que informacion tienes de\s+(.+?)(?:\?|$)",
             r"que informacion tienes sobre\s+(.+?)(?:\?|$)",
             r"que informacion hay de\s+(.+?)(?:\?|$)",
@@ -3669,6 +4031,10 @@ class SalesAssistantService:
                 " si solo pudiera hacer una accion hoy ",
                 " que tres clientes debo atacar primero esta semana ",
                 " conclusion y luego evidencia sobre mi cartera ",
+                " realice ",
+                " realicé ",
+                " hice ",
+                " por confirmar ",
             ]
             if any(signal in padded for signal in self_scope_signals):
                 return user.crm_owner_name
@@ -4901,6 +5267,16 @@ class SalesAssistantService:
             for chunk in evidence["document_chunks"][:4]:
                 doc_lines.append(f"- {chunk['file_name']} | chunk {chunk['chunk_index']} | {chunk['content'][:220]}")
             sections.append("Soporte documental interno:\n" + "\n".join(doc_lines))
+        if evidence.get("web_result"):
+            web_block: list[str] = []
+            web_summary = (evidence["web_result"].get("summary") or "").strip()
+            if web_summary:
+                web_block.append(web_summary)
+            web_lines = self._format_web_sources(evidence["web_result"].get("sources") or [])
+            if web_lines:
+                web_block.append("Fuentes web consultadas:\n" + "\n".join(web_lines))
+            if web_block:
+                sections.append("Soporte web externo:\n" + "\n\n".join(web_block))
         return "\n\n".join(section for section in sections if section.strip()) or "No encontre evidencia suficiente para responder."
 
     def _build_prompt(self, question: str, intent: QuestionIntent, evidence: dict[str, Any], pack: EvidencePack) -> str:
@@ -4937,7 +5313,7 @@ class SalesAssistantService:
             "Ayudas a direccion y vendedores con KPIs, cartera, comparativas, historial de notas, compromisos, llamadas, oportunidades y contexto comercial por cliente.",
             "Responde en español claro, natural, ejecutivo y accionable.",
             "Tu estilo debe sentirse cercano a ChatGPT nativo: adaptable, conversacional, preciso y nada robotico.",
-            "Usa solo la evidencia proporcionada de Zoho CRM y PDFs locales.",
+            "Usa solo la evidencia proporcionada de Zoho CRM y PDFs locales. Si tambien se aporta evidencia web, usala solo como complemento externo y dejalo claro.",
             "No inventes contactos, teléfonos, correos, responsables, unidades ni conclusiones.",
             "Si la evidencia es parcial, entrega lo que sí está respaldado y di claramente lo que falta.",
             "Cuando la pregunta sea amplia, sintetiza primero el panorama y luego baja a datos concretos.",
@@ -4953,6 +5329,8 @@ class SalesAssistantService:
             instructions.append("Prioriza una respuesta con criterio comercial, conclusion, evidencia relevante y siguiente paso.")
         if evidence.get("document_chunks"):
             instructions.append("Si usas soporte de PDFs, menciona al final 'Fuentes internas consultadas:' seguido de los nombres de archivo relevantes.")
+        if evidence.get("web_result"):
+            instructions.append("Si usas soporte web, separa claramente lo externo de lo interno y menciona al final 'Fuentes web consultadas:' seguido de titulo y URL.")
         if task.desired_format == "email":
             instructions.append("Entrega un correo listo para enviar, con asunto y cuerpo natural. Usa tono humano y comercial.")
         elif task.desired_format == "message":
@@ -5011,6 +5389,8 @@ class SalesAssistantService:
             f"Brecha temporal de cuenta: {evidence.get('time_gap_summary')}",
             f"Cambio entre periodos: {evidence.get('period_change')}",
             "Fragmentos de documentos:\n" + serialize_rows(evidence.get("document_chunks", [])),
+            f"Resumen web complementario: {evidence.get('web_result', {}).get('summary') if evidence.get('web_result') else None}",
+            "Fuentes web detectadas:\n" + serialize_rows(evidence.get("web_result", {}).get("sources", []) if evidence.get("web_result") else []),
         ]
         direct_answer = evidence.get("direct_answer")
         if direct_answer:
