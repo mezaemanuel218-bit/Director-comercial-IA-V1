@@ -157,7 +157,7 @@ class SalesAssistantService:
             )
 
         if not self.client:
-            fallback = self._compose_fallback_answer(pack)
+            fallback = self._finalize_answer(self._compose_fallback_answer(pack), effective_question, evidence)
             return AssistantResponse(
                 mode=intent.mode,
                 sources=evidence["sources"],
@@ -175,6 +175,7 @@ class SalesAssistantService:
         answer = content or self._compose_fallback_answer(pack)
         if self._response_looks_empty(answer) and evidence.get("direct_answer"):
             answer = self._compose_fallback_answer(pack)
+        answer = self._finalize_answer(answer, effective_question, evidence)
         return AssistantResponse(
             mode=intent.mode,
             sources=evidence["sources"],
@@ -193,6 +194,20 @@ class SalesAssistantService:
         if not correction or similarity < 0.9:
             return None
         return correction
+
+    def _finalize_answer(self, answer: str, question: str, evidence: dict[str, Any]) -> str:
+        final_answer = (answer or "").strip()
+        if not final_answer:
+            return final_answer
+        if evidence.get("document_chunks") and self._question_is_document_focused(question):
+            normalized = self._normalize_search_text(final_answer)
+            if "fuentes internas consultadas" not in normalized:
+                citations = ", ".join(
+                    dict.fromkeys(chunk.get("file_name") or "documento interno" for chunk in evidence.get("document_chunks", [])[:4])
+                )
+                if citations:
+                    final_answer += f"\n\nFuentes internas consultadas: {citations}"
+        return final_answer
 
     def _today(self) -> date:
         return datetime.now().date()
@@ -452,6 +467,176 @@ class SalesAssistantService:
             "question": question,
         }
 
+    def _extract_topic_keyword(self, question: str) -> str | None:
+        normalized = self._normalize_search_text(question)
+        patterns = [
+            r"ultima vez que (?:hablo|hablaron|menciono|mencionaron|se hablo de|se menciono) (?:de )?(.+?)(?: en | con | para | del | de la | de |$)",
+            r"ultima vez que (?:se vio|se toco) (.+?)(?: en | con | para | del | de la | de |$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, normalized)
+            if match:
+                candidate = self._clean_search_term(match.group(1))
+                if candidate and not self._is_noise_entity_hint(candidate):
+                    return candidate
+        return None
+
+    def _last_topic_mention(
+        self,
+        conn: sqlite3.Connection,
+        topic: str,
+        entity_term: str | None = None,
+        owner_scope: str | None = None,
+    ) -> dict[str, Any] | None:
+        topic_pattern = f"%{self._clean_search_term(topic)}%"
+        rows: list[dict[str, Any]] = []
+
+        note_query = """
+        SELECT
+            'note' AS source_kind,
+            created_time AS happened_at,
+            parent_name AS related_name,
+            owner_name,
+            content_text AS text,
+            title
+        FROM notes
+        WHERE norm(content_text) LIKE ?
+        """
+        note_params: list[Any] = [topic_pattern]
+        if owner_scope:
+            note_query += " AND owner_name = ?"
+            note_params.append(owner_scope)
+        entity_clause, entity_params = self._entity_filter_clause("parent_name", entity_term)
+        note_query += entity_clause
+        note_params.extend(entity_params)
+        note_query += " ORDER BY created_time DESC LIMIT 8"
+        rows.extend(dict(row) for row in conn.execute(note_query, note_params).fetchall())
+
+        interaction_query = """
+        SELECT
+            source_type AS source_kind,
+            interaction_at AS happened_at,
+            related_name,
+            owner_name,
+            coalesce(summary, detail, status) AS text,
+            NULL AS title
+        FROM interactions
+        WHERE (
+            norm(coalesce(summary, '')) LIKE ?
+            OR norm(coalesce(detail, '')) LIKE ?
+            OR norm(coalesce(status, '')) LIKE ?
+        )
+        """
+        interaction_params: list[Any] = [topic_pattern, topic_pattern, topic_pattern]
+        if owner_scope:
+            interaction_query += " AND owner_name = ?"
+            interaction_params.append(owner_scope)
+        entity_clause, entity_params = self._entity_filter_clause("related_name", entity_term)
+        interaction_query += entity_clause
+        interaction_params.extend(entity_params)
+        interaction_query += " ORDER BY interaction_at DESC LIMIT 8"
+        rows.extend(dict(row) for row in conn.execute(interaction_query, interaction_params).fetchall())
+
+        if not rows:
+            return None
+        rows.sort(key=lambda row: row.get("happened_at") or "", reverse=True)
+        return rows[0]
+
+    def _period_windows_from_question(self, question: str) -> tuple[TimeWindow, TimeWindow] | None:
+        normalized = self._normalize_search_text(question)
+        today = self._today()
+        month_names = "|".join(MONTH_NAME_TO_NUMBER.keys())
+        match = re.search(
+            rf"entre\s+({month_names})(?:\s+de\s+(\d{{4}}))?\s+y\s+({month_names})(?:\s+de\s+(\d{{4}}))?",
+            normalized,
+        )
+        if not match:
+            return None
+        month_a = MONTH_NAME_TO_NUMBER[match.group(1)]
+        year_a = int(match.group(2) or today.year)
+        month_b = MONTH_NAME_TO_NUMBER[match.group(3)]
+        year_b = int(match.group(4) or year_a)
+        start_a = date(year_a, month_a, 1)
+        end_a = self._end_of_month(year_a, month_a)
+        start_b = date(year_b, month_b, 1)
+        end_b = self._end_of_month(year_b, month_b)
+        return (
+            TimeWindow(start_a, end_a, f"{match.group(1)} {year_a}", "month"),
+            TimeWindow(start_b, end_b, f"{match.group(3)} {year_b}", "month"),
+        )
+
+    def _period_change_for_entity(
+        self,
+        conn: sqlite3.Connection,
+        term: str,
+        window_a: TimeWindow,
+        window_b: TimeWindow,
+        owner_scope: str | None = None,
+    ) -> dict[str, Any]:
+        review_a = self._time_window_overview(conn, window_a, f"{term} {window_a.label}", owner_scope=owner_scope, entity_term=term)
+        review_b = self._time_window_overview(conn, window_b, f"{term} {window_b.label}", owner_scope=owner_scope, entity_term=term)
+
+        def summarize(review: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "interactions": len(review.get("interactions") or []),
+                "notes": len(review.get("notes") or []),
+                "tasks": len(review.get("tasks") or []),
+                "events": len(review.get("events") or []),
+                "latest_note": (review.get("notes") or [{}])[0],
+                "latest_interaction": (review.get("interactions") or [{}])[0],
+            }
+
+        summary_a = summarize(review_a)
+        summary_b = summarize(review_b)
+        return {
+            "entity": term,
+            "window_a": review_a.get("window"),
+            "window_b": review_b.get("window"),
+            "summary_a": summary_a,
+            "summary_b": summary_b,
+            "delta_interactions": summary_b["interactions"] - summary_a["interactions"],
+            "delta_notes": summary_b["notes"] - summary_a["notes"],
+            "delta_tasks": summary_b["tasks"] - summary_a["tasks"],
+            "delta_events": summary_b["events"] - summary_a["events"],
+        }
+
+    def _entity_time_gap_summary(
+        self,
+        conn: sqlite3.Connection,
+        term: str,
+        owner_scope: str | None = None,
+    ) -> dict[str, Any]:
+        notes = self._recent_notes_for_entity(conn, term, owner_scope=owner_scope)
+        interactions = self._recent_interactions_for_entity(conn, term, owner_scope=owner_scope)
+        first_note = None
+        if notes:
+            ordered_notes = sorted(notes, key=lambda row: row.get("created_time") or "")
+            first_note = ordered_notes[0]
+        latest_call = None
+        for row in interactions:
+            if (row.get("source_type") or "").lower() == "call":
+                latest_call = row
+                break
+        latest_touch = interactions[0] if interactions else None
+        reference_end = latest_call or latest_touch
+
+        days_gap = None
+        if first_note and reference_end:
+            try:
+                start_dt = datetime.fromisoformat(first_note.get("created_time"))
+                end_dt = datetime.fromisoformat(reference_end.get("interaction_at"))
+                days_gap = max(0, (end_dt.date() - start_dt.date()).days)
+            except Exception:
+                days_gap = None
+
+        return {
+            "entity": term,
+            "first_note": first_note,
+            "latest_call": latest_call,
+            "latest_touch": latest_touch,
+            "days_gap": days_gap,
+        }
+
     def get_priority_followups(self, owner: str | None = None, limit: int = 12) -> list[dict[str, Any]]:
         with self._managed_connection() as conn:
             query = """
@@ -587,6 +772,8 @@ class SalesAssistantService:
 
     def _semantic_split_question(self, question: str, user: AppUser | None = None) -> list[str]:
         heuristic_parts = self._split_compound_question(question)
+        if len(heuristic_parts) == 1:
+            heuristic_parts = self._fallback_semantic_like_split(question)
         normalized = self._normalize_search_text(question)
         looks_complex = (
             len(question) >= 140
@@ -646,6 +833,184 @@ class SalesAssistantService:
         cleaned = [part.strip(" ,.;:-") for part in parts if part and part.strip(" ,.;:-")]
         return cleaned or [question]
 
+    def _fallback_semantic_like_split(self, question: str) -> list[str]:
+        candidate = question.strip()
+        patterns = [
+            r"\s*,\s*(?=(?:que|quien|cual|como|dame|hazme|analiza|resume|redacta|escribe|armame)\b)",
+            r"\s+(?:y|e)\s+(?=(?:que|quien|cual|como|dame|hazme|analiza|resume|redacta|escribe|armame)\b)",
+        ]
+        for pattern in patterns:
+            parts = [
+                part.strip(" ,.;:-")
+                for part in re.split(pattern, candidate, flags=re.IGNORECASE)
+                if part and part.strip(" ,.;:-")
+            ]
+            if len(parts) > 1:
+                parts = self._merge_introductory_compound_prefix(parts)
+                parts = self._expand_compound_parts(parts)
+            if len(parts) > 1:
+                return parts
+        return [question]
+
+    def _merge_introductory_compound_prefix(self, parts: list[str]) -> list[str]:
+        if len(parts) < 2:
+            return parts
+        first = parts[0].strip()
+        normalized_first = self._normalize_search_text(first)
+        intro_markers = [
+            "segun zoho",
+            "segun los pdfs",
+            "segun los documentos",
+            "con base en zoho",
+            "con base en los documentos",
+            "con base en los pdfs",
+            "de acuerdo con los documentos",
+            "de acuerdo con los pdfs",
+            "tengo ",
+            "si hoy ",
+            "si solo ",
+        ]
+        actionable_markers = ["que ", "quien ", "cual ", "como ", "dame ", "hazme ", "analiza ", "resume ", "redacta ", "escribe ", "armame "]
+        if any(normalized_first.startswith(marker) for marker in intro_markers) and not any(
+            normalized_first.startswith(marker) for marker in actionable_markers
+        ):
+            merged_first = f"{first}, {parts[1].strip()}"
+            return [merged_first] + parts[2:]
+        return parts
+
+    def _expand_compound_parts(self, parts: list[str]) -> list[str]:
+        expanded: list[str] = []
+        for part in parts:
+            nested = [
+                item.strip(" ,.;:-")
+                for item in re.split(
+                    r"\s+(?:y|e)\s+(?=(?:que|quien|cual|como|dame|hazme|analiza|resume|redacta|escribe|armame)\b)",
+                    part,
+                    flags=re.IGNORECASE,
+                )
+                if item and item.strip(" ,.;:-")
+            ]
+            expanded.extend(nested if len(nested) > 1 else [part.strip(" ,.;:-")])
+        return expanded
+
+    def _time_window_phrase(self, window: TimeWindow | None) -> str:
+        if not window:
+            return ""
+        if window.start_date == window.end_date:
+            return f"el {window.start_date.isoformat()}"
+        return f"entre {window.start_date.isoformat()} y {window.end_date.isoformat()}"
+
+    def _needs_time_scope(self, normalized_question: str) -> bool:
+        markers = [
+            "que paso",
+            "que hubo",
+            "quien agrego",
+            "comentario",
+            "comentarios",
+            "nota",
+            "notas",
+            "compromiso",
+            "compromisos",
+            "tarea",
+            "tareas",
+            "evento",
+            "eventos",
+            "interaccion",
+            "interacciones",
+            "actividad",
+            "llamada",
+            "llamadas",
+        ]
+        return any(marker in normalized_question for marker in markers)
+
+    def _needs_document_scope(self, normalized_question: str) -> bool:
+        markers = [
+            "argumentos",
+            "objeciones",
+            "beneficios",
+            "propuesta",
+            "producto",
+            "productos",
+            "servicio",
+            "servicios",
+            "geotab",
+            "seguridad",
+            "mantenimiento",
+            "valor",
+            "demo",
+            "agenda",
+            "descubrimiento",
+        ]
+        return any(marker in normalized_question for marker in markers)
+
+    def _subresponse_section_title(self, subquestion: str, answer: str) -> str:
+        normalized = self._normalize_search_text(subquestion)
+        normalized_answer = self._normalize_search_text(answer)
+        if any(token in normalized for token in ["correo", "mail", "email", "mensaje", "whatsapp", "redacta", "redactame", "escribe"]):
+            return "Pieza lista"
+        if any(token in normalized for token in ["riesgo", "riesgos", "objecion", "objeciones", "bloqueador", "bloqueadores"]):
+            return "Riesgos y bloqueadores"
+        if any(token in normalized for token in ["plan", "siguiente paso", "recomiendas", "debo", "accion", "prioriza"]):
+            return "Recomendacion"
+        if any(token in normalized for token in ["compar", " vs ", "diferencia entre", "diferencias entre"]):
+            return "Comparativa"
+        if any(token in normalized for token in ["kpi", "kpis", "metrica", "metricas", "indicador", "indicadores"]):
+            return "Indicadores"
+        if any(token in normalized for token in ["resumen", "brief", "contexto", "que debo saber", "como vamos"]):
+            return "Panorama"
+        if self._needs_time_scope(normalized):
+            return "Lectura temporal"
+        if self._needs_document_scope(normalized) or "fuentes internas consultadas" in normalized_answer:
+            return "Soporte documental"
+        return "Respuesta"
+
+    def _rule_based_combine_subresponses(
+        self,
+        question: str,
+        subquestions: list[str],
+        subresponses: list[AssistantResponse],
+    ) -> str | None:
+        merged_pairs: list[tuple[str, str]] = []
+        seen_answers: set[str] = set()
+        for subquestion, subresponse in zip(subquestions, subresponses):
+            answer = (subresponse.answer or "").strip()
+            if not answer:
+                continue
+            normalized_answer = self._normalize_search_text(answer)
+            if normalized_answer in seen_answers:
+                continue
+            seen_answers.add(normalized_answer)
+            merged_pairs.append((subquestion, answer))
+        if len(merged_pairs) < 2:
+            return None
+
+        lines: list[str] = []
+        title_counts: dict[str, int] = {}
+        for subquestion, answer in merged_pairs:
+            title = self._subresponse_section_title(subquestion, answer)
+            title_counts[title] = title_counts.get(title, 0) + 1
+            rendered_title = title if title_counts[title] == 1 else f"{title} {title_counts[title]}"
+            lines.append(f"{rendered_title}:")
+            lines.append(answer)
+            lines.append("")
+
+        combined = "\n".join(lines).strip()
+        if combined and len(question) >= 120:
+            return combined
+        if any(
+            title in combined
+            for title in [
+                "Panorama:",
+                "Riesgos y bloqueadores:",
+                "Recomendacion:",
+                "Pieza lista:",
+                "Soporte documental:",
+                "Lectura temporal:",
+            ]
+        ):
+            return combined
+        return None
+
     def _combine_subresponses(
         self,
         question: str,
@@ -657,6 +1022,9 @@ class SalesAssistantService:
         semantic = self._semantic_combine_subresponses(question, subquestions, subresponses)
         if semantic:
             return semantic
+        rule_based = self._rule_based_combine_subresponses(question, subquestions, subresponses)
+        if rule_based:
+            return rule_based
         if len(subresponses) <= 2:
             if any(response.evidence.get("entity_suggestions") for response in subresponses):
                 preferred = [response for response in subresponses if response.evidence.get("entity_suggestions")]
@@ -718,6 +1086,8 @@ class SalesAssistantService:
         carried_entity = self._extract_entity_hint(original_question)
         owner_scope = self._resolve_owner_scope(original_question, user)
         relative_entity = self._top_priority_entity_for_owner(owner_scope) if owner_scope else None
+        original_time_window = self._parse_time_window(original_question)
+        original_document_scope = self._question_is_document_focused(original_question)
         contextualized: list[str] = []
         for subquestion in subquestions:
             extracted = self._extract_entity_hint(subquestion)
@@ -751,11 +1121,40 @@ class SalesAssistantService:
                 contextualized.append(rewritten)
             elif "responderlas" in normalized:
                 contextualized.append(f"objeciones probables y como responderlas de {carried}")
-            elif any(token in normalized for token in ["riesgo", "riesgos", "objecion", "objeciones", "resume", "resumen", "cuenta"]):
+            elif any(
+                token in normalized
+                for token in [
+                    "riesgo",
+                    "riesgos",
+                    "objecion",
+                    "objeciones",
+                    "resume",
+                    "resumen",
+                    "cuenta",
+                    "plan",
+                    "siguiente paso",
+                    "recomienda",
+                    "recomendarias",
+                    "recomendacion",
+                    "accion",
+                    "prioriza",
+                    "debo",
+                ]
+            ):
                 contextualized.append(f"{subquestion.strip()} de {carried}")
             else:
                 contextualized.append(subquestion)
-        return contextualized
+        finalized: list[str] = []
+        for subquestion in contextualized:
+            rewritten = subquestion.strip()
+            normalized = self._normalize_search_text(rewritten)
+            if original_time_window and not self._parse_time_window(rewritten) and self._needs_time_scope(normalized):
+                rewritten = f"{rewritten} {self._time_window_phrase(original_time_window)}"
+                normalized = self._normalize_search_text(rewritten)
+            if original_document_scope and not self._question_has_explicit_document_scope(rewritten) and self._needs_document_scope(normalized):
+                rewritten = f"{rewritten} con base en los documentos internos"
+            finalized.append(rewritten)
+        return finalized
 
     def _looks_like_instruction_phrase(self, normalized_question: str, extracted_hint: str) -> bool:
         if extracted_hint != normalized_question:
@@ -970,6 +1369,8 @@ class SalesAssistantService:
         task = pack.task
         if task.desired_format == "conclusion_evidence":
             return self._format_conclusion_then_evidence(pack)
+        if task.desired_format == "executive":
+            return self._format_executive_brief(pack)
         if evidence.get("entity_suggestions") and evidence.get("entity_hint") and not evidence.get("entity_brief"):
             return self._format_entity_suggestions(evidence["entity_hint"], evidence["entity_suggestions"])
         if evidence.get("action_plan"):
@@ -1010,6 +1411,157 @@ class SalesAssistantService:
             lines.append("Evidencia:")
             lines.append(self._format_entity_brief(brief))
             return "\n".join(lines)
+        return evidence.get("direct_answer") or self._format_evidence_fallback(evidence)
+
+    def _format_executive_brief(self, pack: EvidencePack) -> str:
+        evidence = pack.evidence
+        task = pack.task
+        if evidence.get("team_brief"):
+            brief = evidence["team_brief"]
+            global_kpis = brief.get("global_kpis") or {}
+            weekly_kpis = brief.get("weekly_kpis") or {}
+            priorities = brief.get("priorities") or []
+            top_priority = priorities[0] if priorities else None
+            lines = [
+                "Resumen ejecutivo del equipo",
+                (
+                    f"Decision sugerida: priorizar {top_priority.get('related_name') if top_priority else 'la revision de cartera mas activa'} "
+                    f"y revisar a los vendedores con menor traccion reciente."
+                ),
+                "",
+                "Lectura actual:",
+                (
+                    f"- El equipo acumula {global_kpis.get('total_interactions', 0)} interacciones, "
+                    f"{weekly_kpis.get('total_interactions', 0)} en los ultimos 7 dias y "
+                    f"{global_kpis.get('owners', 0)} vendedores con actividad."
+                ),
+            ]
+            by_owner = global_kpis.get("by_owner") or []
+            if by_owner:
+                top_owner = by_owner[0]
+                lines.append(
+                    f"- El vendedor con mayor traccion visible es {top_owner.get('owner_name') or 'Sin responsable'} con {top_owner.get('total') or 0} interacciones."
+                )
+            if top_priority:
+                lines.extend(
+                    [
+                        "",
+                        "Oportunidad principal:",
+                        f"- {top_priority.get('related_name') or 'Sin nombre'} | {top_priority.get('owner_name') or 'Sin responsable'} | prioridad {top_priority.get('priority_label') or '-'}",
+                    ]
+                )
+            lines.extend(
+                [
+                    "",
+                    "Siguiente paso recomendado:",
+                    "- revisar cartera caliente, validar pendientes abiertos y asegurar seguimiento con fecha esta misma semana.",
+                ]
+            )
+            return "\n".join(lines)
+
+        if evidence.get("owner_brief"):
+            brief = evidence["owner_brief"]
+            owner_name = brief.get("owner_name") or pack.owner_scope or "el vendedor"
+            kpis = brief.get("kpis") or {}
+            weekly_kpis = brief.get("weekly_kpis") or {}
+            priorities = brief.get("priorities") or []
+            stale = brief.get("stale_contacts") or []
+            pending = brief.get("pending_tasks") or []
+            top_priority = priorities[0] if priorities else None
+            lines = [
+                f"Resumen ejecutivo de {owner_name}",
+                (
+                    f"Decision sugerida: concentrar el esfuerzo en {top_priority.get('related_name') if top_priority else 'la cuenta con mayor señal comercial'} "
+                    f"y limpiar pendientes visibles."
+                ),
+                "",
+                "Lectura actual:",
+                (
+                    f"- Tiene {brief.get('assigned_clients_count', 0)} clientes o prospectos asignados, "
+                    f"{weekly_kpis.get('total_interactions', 0)} interacciones en los ultimos 7 dias y "
+                    f"{kpis.get('total_interactions', 0)} acumuladas."
+                ),
+            ]
+            if top_priority:
+                reason_text = " / ".join(top_priority.get("reasons") or [])
+                lines.append(f"- La oportunidad mas movible hoy es {top_priority.get('related_name') or 'Sin nombre'} por {reason_text[:180]}.")
+            if pending:
+                lines.append(f"- Tiene {len(pending)} compromisos pendientes visibles.")
+            if stale:
+                lines.append(f"- Tambien hay {len(stale)} cuentas frias o rezagadas que requieren rescate o descarte.")
+            lines.extend(
+                [
+                    "",
+                    "Siguiente paso recomendado:",
+                    (
+                        f"- hoy: mover {top_priority.get('related_name') if top_priority else 'la mejor cuenta visible'}; "
+                        "esta semana: convertir seguimiento en compromiso con fecha."
+                    ),
+                ]
+            )
+            return "\n".join(lines)
+
+        if evidence.get("entity_brief"):
+            brief = evidence["entity_brief"]
+            latest = brief.get("latest_row") or {}
+            entity_label = (
+                latest.get("company_name")
+                or latest.get("contact_name")
+                or latest.get("full_name")
+                or brief.get("entity_term")
+                or pack.entity_name
+                or "la cuenta"
+            )
+            insights = brief.get("insights") or {}
+            risks = (brief.get("risk_profile") or {}).get("risks") or []
+            opportunity = (insights.get("signals") or ["hay actividad comercial registrada"])[0]
+            next_step = insights.get("next_step") or "definir siguiente paso con fecha"
+            lines = [
+                f"Resumen ejecutivo de {entity_label}",
+                f"Decision sugerida: avanzar con {entity_label} si se puede convertir la señal actual en un siguiente paso concreto esta semana.",
+                "",
+                "Lectura actual:",
+            ]
+            if insights.get("status"):
+                lines.append(f"- {insights['status']}")
+            lines.append(f"- Oportunidad visible: {opportunity}")
+            if risks:
+                lines.append(f"- Riesgo principal: {risks[0]}")
+            owners = brief.get("owners") or []
+            if owners:
+                lines.append(f"- Responsable(s): {', '.join(owners[:4])}")
+            lines.extend(
+                [
+                    "",
+                    "Siguiente paso recomendado:",
+                    f"- {next_step}",
+                ]
+            )
+            if evidence.get("document_chunks") and self._question_is_document_focused(pack.question):
+                citations = ", ".join(
+                    dict.fromkeys(chunk.get("file_name") or "documento interno" for chunk in evidence.get("document_chunks", [])[:4])
+                )
+                if citations:
+                    lines.append("")
+                    lines.append(f"Fuentes internas consultadas: {citations}")
+            return "\n".join(lines)
+
+        if evidence.get("action_plan"):
+            plan = evidence["action_plan"]
+            lines = [
+                plan.get("headline") or "Resumen ejecutivo",
+                f"Decision sugerida: {plan.get('summary') or 'ejecutar el plan sugerido sin retraso.'}",
+            ]
+            if plan.get("today"):
+                lines.extend(["", "Hoy:", f"- {plan['today']}"])
+            if plan.get("tomorrow"):
+                lines.append(f"- Mañana: {plan['tomorrow']}")
+            if plan.get("week"):
+                lines.append(f"- Esta semana: {plan['week']}")
+            return "\n".join(lines)
+
+        if task.task_type == "metrics" and evidence.get("global_kpis"):
+            return self._format_global_kpis(evidence["global_kpis"], evidence["global_kpis"].get("window_days"))
         return evidence.get("direct_answer") or self._format_evidence_fallback(evidence)
 
     def _should_prefer_direct_answer(self, intent: QuestionIntent, evidence: dict[str, Any], task: TaskInterpretation) -> bool:
@@ -1054,6 +1606,9 @@ class SalesAssistantService:
                 "global_kpis",
                 "entity_kpis",
                 "time_review",
+                "topic_mention",
+                "time_gap_summary",
+                "period_change",
             ]
             if any(evidence.get(key) for key in simple_keys):
                 return True
@@ -1081,6 +1636,9 @@ class SalesAssistantService:
             "last_interactions",
             "risk_profile",
             "time_review",
+            "topic_mention",
+            "time_gap_summary",
+            "period_change",
         ]
         return any(evidence.get(key) for key in structured_keys)
 
@@ -1144,6 +1702,8 @@ class SalesAssistantService:
                 or evidence.get("contact_rows")
             )
             asks_for_count = any(token in normalized_question for token in ["cuantos", "cuantas", "cuanto", "cantidad", "numero de", "número de"])
+            topic_keyword = self._extract_topic_keyword(question)
+            period_windows = self._period_windows_from_question(question)
             asks_for_rank = any(token in normalized_question for token in ["mejor", "mejores", "top", "principal", "principales"]) and any(
                 token in normalized_question for token in ["cliente", "clientes", "prospecto", "prospectos", "cuenta", "cuentas", "lead", "leads"]
             )
@@ -1157,6 +1717,16 @@ class SalesAssistantService:
                     entity_term=entity_term,
                 )
                 evidence["direct_answer"] = self._format_time_window_review(evidence["time_review"], question)
+            elif entity_term and topic_keyword and entity_has_evidence:
+                evidence["topic_keyword"] = topic_keyword
+                evidence["topic_mention"] = self._last_topic_mention(conn, topic_keyword, entity_term=entity_term, owner_scope=owner_scope)
+                evidence["direct_answer"] = self._format_topic_mention(evidence["topic_mention"], topic_keyword, entity_term)
+            elif entity_term and "cuanto tiempo paso entre" in normalized_question and entity_has_evidence:
+                evidence["time_gap_summary"] = self._entity_time_gap_summary(conn, entity_term, owner_scope=owner_scope)
+                evidence["direct_answer"] = self._format_entity_time_gap(evidence["time_gap_summary"])
+            elif entity_term and period_windows and any(token in normalized_question for token in ["que cambio", "que cambiÃ³", "cambio", "cambios", "entre"]):
+                evidence["period_change"] = self._period_change_for_entity(conn, entity_term, period_windows[0], period_windows[1], owner_scope=owner_scope)
+                evidence["direct_answer"] = self._format_period_change(evidence["period_change"])
             elif asks_for_rank and owner_scope:
                 limit = self._extract_rank_limit(normalized_question)
                 evidence["ranked_accounts"] = self._owner_ranked_accounts(conn, owner_scope, limit=limit)
@@ -1317,6 +1887,18 @@ class SalesAssistantService:
             evidence["document_chunks"] = self._document_search(conn, question, entity_term)
             if evidence["document_chunks"]:
                 evidence["sources"].extend(sorted({chunk["file_name"] for chunk in evidence["document_chunks"]}))
+                if (
+                    not evidence.get("direct_answer")
+                    and self._question_is_document_focused(question)
+                    and not (
+                        intent.asks_for_client_brief
+                        or intent.asks_for_owner_brief
+                        or intent.asks_for_team_brief
+                        or intent.asks_for_action_plan
+                    )
+                ):
+                    evidence["document_summary"] = self._document_summary(question, evidence["document_chunks"])
+                    evidence["direct_answer"] = self._format_document_summary(evidence["document_summary"])
 
         return evidence
 
@@ -1398,13 +1980,18 @@ class SalesAssistantService:
             r"hablame sobre\s+(.+?)(?:\?|$)",
             r"que plan de accion me recomiendas para\s+(.+?)(?:\?|$)",
             r"plan de accion para\s+(.+?)(?:\?|$)",
+            r"cuanto tiempo paso entre.+?\s+de\s+(.+)$",
             r"como vamos con\s+(.+)$",
             r"que sigue con\s+(.+)$",
             r"que decision maker ves en\s+(.+)$",
             r"vale la pena seguir insistiendo con\s+(.+)$",
             r"que objeciones?(?:\s+hay)?\s+(?:en|de)\s+(.+)$",
             r"que objeciones?\s+tiene\s+(.+)$",
+            r"ultima vez que .+?\s+en\s+(.+)$",
+            r"que cambio(?:\s+entre.+?)?\s+en\s+(.+)$",
             r"hazme un resumen ejecutivo de\s+(.+)$",
+            r"dame un resumen ejecutivo de\s+(.+)$",
+            r"necesito un resumen ejecutivo de\s+(.+)$",
             r"resumen(?: comercial)? de\s+(.+)$",
             r"resumeme\s+(.+?)\s+en\s+contexto,\s*riesgo\s+y\s+siguiente\s+paso$",
             r"resume la cuenta(?: de)?\s+(.+)$",
@@ -2165,6 +2752,7 @@ class SalesAssistantService:
         )
         insights = brief.get("insights") or {}
         contacts = brief.get("contacts") or []
+        docs = brief.get("document_chunks") or []
         notes_text = " || ".join((row.get("content_text") or "") for row in (brief.get("recent_notes") or [])).lower()
 
         bullets = [
@@ -2176,6 +2764,13 @@ class SalesAssistantService:
             bullets.insert(0, "mejoras sobre su esquema actual de rastreo y monitoreo")
         if "whatsapp" in notes_text:
             bullets.append("seguimiento agil por WhatsApp para acelerar coordinacion")
+        for chunk in docs[:3]:
+            snippet = (chunk.get("content") or "").replace("\n", " ").strip()
+            if not snippet:
+                continue
+            lowered = snippet.lower()
+            if any(token in lowered for token in ["seguridad", "mantenimiento", "control", "operacion", "flota", "gps"]):
+                bullets.append(snippet[:140])
 
         objections = insights.get("objections") or []
         responses = []
@@ -2189,6 +2784,7 @@ class SalesAssistantService:
             "contact_name": contacts[0].get("label") if contacts else None,
             "next_step": insights.get("next_step"),
             "responses": responses,
+            "document_chunks": docs[:4],
         }
 
     def _entity_kpis(self, conn: sqlite3.Connection, term: str, owner_scope: str | None = None) -> dict[str, Any]:
@@ -2919,6 +3515,79 @@ class SalesAssistantService:
         except sqlite3.OperationalError:
             return []
 
+    def _question_is_document_focused(self, question: str) -> bool:
+        normalized = self._normalize_search_text(question)
+        markers = [
+            "segun los pdfs",
+            "segun los documentos",
+            "de acuerdo con los pdfs",
+            "de acuerdo con los documentos",
+            "que dice geotab",
+            "que dicen los pdfs",
+            "en los pdfs",
+            "en los documentos",
+            "beneficios",
+            "objeciones",
+            "argumentos de venta",
+            "propuesta comercial",
+            "seguridad",
+            "mantenimiento",
+            "solucion",
+            "soluciones",
+            "producto",
+            "productos",
+        ]
+        return any(marker in normalized for marker in markers)
+
+    def _question_has_explicit_document_scope(self, question: str) -> bool:
+        normalized = self._normalize_search_text(question)
+        markers = [
+            "segun los pdfs",
+            "segun los documentos",
+            "de acuerdo con los pdfs",
+            "de acuerdo con los documentos",
+            "en los pdfs",
+            "en los documentos",
+            "con base en los documentos internos",
+            "con base en los pdfs",
+            "con base en los documentos",
+        ]
+        return any(marker in normalized for marker in markers)
+
+    def _document_summary(self, question: str, chunks: list[dict[str, Any]]) -> dict[str, Any]:
+        normalized = self._normalize_search_text(question)
+        grouped: dict[str, list[str]] = {}
+        for chunk in chunks:
+            file_name = chunk.get("file_name") or "documento_interno"
+            grouped.setdefault(file_name, [])
+            content = (chunk.get("content") or "").replace("\n", " ").strip()
+            if content:
+                grouped[file_name].append(content)
+
+        bullets: list[str] = []
+        citations: list[str] = []
+        for file_name, snippets in grouped.items():
+            citations.append(file_name)
+            for snippet in snippets[:2]:
+                clean = re.sub(r"\s+", " ", snippet).strip()
+                if clean:
+                    bullets.append(clean[:220])
+            if len(bullets) >= 6:
+                break
+
+        topic_hint = None
+        for keyword in ["geotab", "seguridad", "mantenimiento", "demo", "control", "operacion", "operativa", "gps", "flota"]:
+            if keyword in normalized:
+                topic_hint = keyword
+                break
+
+        return {
+            "question": question,
+            "topic_hint": topic_hint,
+            "bullets": bullets[:6],
+            "citations": citations[:4],
+        }
+
     def _mentioned_owner_names(self, question: str) -> list[str]:
         normalized = self._normalize_search_text(question)
         aliases: dict[str, str] = {
@@ -3128,6 +3797,7 @@ class SalesAssistantService:
             r"\s+y hazme\s+.+$",
             r"\s+y fabrica\s+.+$",
             r"\s+y proponme\s+.+$",
+            r",\s*(?=(?:que|quien|cual|como|dame|hazme|analiza|resume|redacta|escribe|armame)\b).+$",
         ]
         for pattern in connector_patterns:
             cleaned = re.sub(pattern, "", cleaned).strip(" ,.;:-")
@@ -3279,6 +3949,8 @@ class SalesAssistantService:
         lines = [f"Resumen comercial de {entity_label}"]
         insights = brief.get("insights") or {}
         if insights.get("status"):
+            lines.append(f"En corto: {insights['status']}")
+        if insights.get("status"):
             lines.append(f"Lectura actual: {insights['status']}")
         if insights.get("signals"):
             lines.append("Señales comerciales: " + " ".join(insights["signals"]))
@@ -3355,6 +4027,25 @@ class SalesAssistantService:
                 lines.append(f"- {risk}")
         return "\n".join(lines)
 
+    def _format_document_summary(self, summary: dict[str, Any]) -> str:
+        if not summary:
+            return "No encontre soporte documental suficiente para responder con base en PDFs."
+        bullets = summary.get("bullets") or []
+        citations = summary.get("citations") or []
+        topic = summary.get("topic_hint")
+        if not bullets:
+            return "No encontre soporte documental suficiente para responder con base en PDFs."
+        title = "Lectura documental interna"
+        if topic:
+            title += f" sobre {topic}"
+        lines = [title + ":"]
+        for bullet in bullets[:5]:
+            lines.append(f"- {bullet}")
+        if citations:
+            lines.append("")
+            lines.append("Fuentes internas consultadas: " + ", ".join(citations))
+        return "\n".join(lines)
+
     def _format_sales_draft(self, draft: dict[str, Any]) -> str:
         if not draft:
             return "No encontre suficiente contexto para redactar un correo comercial util."
@@ -3382,7 +4073,7 @@ class SalesAssistantService:
             return "No encontre suficiente contexto para proponer un plan accionable."
         lines = [plan.get("headline") or "Plan de accion"]
         if plan.get("summary"):
-            lines.append(plan["summary"])
+            lines.append(f"En corto: {plan['summary']}")
         if plan.get("contact_line"):
             lines.append(f"Contacto recomendado: {plan['contact_line']}")
 
@@ -3484,6 +4175,10 @@ class SalesAssistantService:
             lines.append(f"- {bullet}")
         if next_step:
             lines.append(f"Siguiente paso sugerido: {next_step}")
+        docs = material.get("document_chunks") or []
+        if docs:
+            cited = ", ".join(dict.fromkeys((row.get("file_name") or "documento interno") for row in docs[:4]))
+            lines.append(f"Soporte documental interno: {cited}")
         return "\n".join(lines)
 
     def _format_owner_brief(self, brief: dict[str, Any], owner_scope: str | None) -> str:
@@ -3495,6 +4190,11 @@ class SalesAssistantService:
         weekly_kpis = brief.get("weekly_kpis") or {}
         lines = [
             f"Panorama comercial de {owner_name}",
+            (
+                f"En corto: veo {brief.get('assigned_clients_count', 0)} clientes o prospectos asignados, "
+                f"{weekly_kpis.get('total_interactions', 0)} interacciones en los ultimos 7 dias y "
+                f"{kpis.get('total_interactions', 0)} interacciones acumuladas."
+            ),
             f"Interacciones totales: {kpis.get('total_interactions', 0)}",
             f"Cuentas unicas activas: {kpis.get('unique_accounts', 0)}",
             f"Clientes y prospectos asignados: {brief.get('assigned_clients_count', 0)}",
@@ -3547,6 +4247,11 @@ class SalesAssistantService:
         weekly_kpis = brief.get("weekly_kpis") or {}
         lines = [
             "Panorama comercial del equipo Flotimatics",
+            (
+                f"En corto: el equipo trae {global_kpis.get('total_interactions', 0)} interacciones acumuladas, "
+                f"{weekly_kpis.get('total_interactions', 0)} en los ultimos 7 dias y "
+                f"{global_kpis.get('owners', 0)} vendedores con actividad."
+            ),
             f"Interacciones totales: {global_kpis.get('total_interactions', 0)}",
             f"Cuentas unicas: {global_kpis.get('unique_accounts', 0)}",
             f"Vendedores con actividad: {global_kpis.get('owners', 0)}",
@@ -3647,7 +4352,10 @@ class SalesAssistantService:
             owner_label = owner_scope or "ese vendedor"
             return f"No encontre cuentas suficientes para rankear a {owner_label}."
         owner_label = owner_scope or "ese vendedor"
-        lines = [f"Top {min(limit, len(rows))} clientes o prospectos de {owner_label}:"]
+        lines = [
+            f"Top {min(limit, len(rows))} clientes o prospectos de {owner_label}:",
+            "En corto: estas son las cuentas con mayor traccion visible para mover primero.",
+        ]
         for index, row in enumerate(rows[:limit], start=1):
             reasons = []
             if row.get("total_interactions"):
@@ -3927,6 +4635,77 @@ class SalesAssistantService:
                 )
         return "\n".join(lines)
 
+    def _format_topic_mention(self, row: dict[str, Any] | None, topic: str, entity_term: str | None) -> str:
+        entity_label = entity_term or "la cuenta consultada"
+        if not row:
+            return f"No encontre una mencion clara sobre {topic} en {entity_label}."
+        snippet = (row.get("text") or row.get("title") or "").replace("\n", " ").strip()
+        return (
+            f"La ultima vez que veo una mencion de {topic} en {entity_label} fue el {row.get('happened_at') or '-'} | "
+            f"{row.get('source_kind') or '-'} | {row.get('related_name') or entity_label} | "
+            f"{row.get('owner_name') or 'Sin responsable'} | {snippet[:220]}"
+        )
+
+    def _format_entity_time_gap(self, summary: dict[str, Any]) -> str:
+        entity = summary.get("entity") or "la cuenta"
+        first_note = summary.get("first_note")
+        latest_call = summary.get("latest_call")
+        latest_touch = summary.get("latest_touch")
+        reference = latest_call or latest_touch
+        if not first_note or not reference:
+            return f"No pude calcular el tiempo entre hitos para {entity} porque falta una primera nota o una interaccion final clara."
+        relation = "ultima llamada" if latest_call else "ultima interaccion"
+        gap = summary.get("days_gap")
+        gap_text = f"{gap} dias" if gap is not None else "un intervalo no calculable con precision"
+        return (
+            f"Para {entity}, desde la primera nota ({first_note.get('created_time') or '-'}) hasta la {relation} "
+            f"({reference.get('interaction_at') or '-'}) pasaron {gap_text}."
+        )
+
+    def _format_period_change(self, change: dict[str, Any]) -> str:
+        entity = change.get("entity") or "la cuenta"
+        window_a = change.get("window_a") or {}
+        window_b = change.get("window_b") or {}
+        summary_a = change.get("summary_a") or {}
+        summary_b = change.get("summary_b") or {}
+
+        def change_word(delta: int, positive: str, negative: str) -> str:
+            if delta > 0:
+                return positive
+            if delta < 0:
+                return negative
+            return "se mantuvo igual"
+
+        interactions_change = change_word(change.get("delta_interactions", 0), "subieron", "bajaron")
+        notes_change = change_word(change.get("delta_notes", 0), "subieron", "bajaron")
+        tasks_change = change_word(change.get("delta_tasks", 0), "subieron", "bajaron")
+
+        lines = [
+            f"Cambio comercial de {entity} entre {window_a.get('label') or 'periodo A'} y {window_b.get('label') or 'periodo B'}:",
+            "",
+            f"- Interacciones: {summary_a.get('interactions', 0)} -> {summary_b.get('interactions', 0)} ({interactions_change})",
+            f"- Notas: {summary_a.get('notes', 0)} -> {summary_b.get('notes', 0)} ({notes_change})",
+            f"- Tareas: {summary_a.get('tasks', 0)} -> {summary_b.get('tasks', 0)} ({tasks_change})",
+            f"- Eventos: {summary_a.get('events', 0)} -> {summary_b.get('events', 0)}",
+        ]
+
+        latest_note_b = summary_b.get("latest_note") or {}
+        latest_interaction_b = summary_b.get("latest_interaction") or {}
+        if latest_note_b and latest_note_b.get("created_time"):
+            snippet = (latest_note_b.get("content_text") or latest_note_b.get("title") or "").replace("\n", " ").strip()
+            lines.extend(
+                [
+                    "",
+                    "Lo mas reciente del segundo periodo:",
+                    f"- Nota: {latest_note_b.get('created_time')} | {latest_note_b.get('parent_name') or 'Sin cliente'} | {snippet[:180]}",
+                ]
+            )
+        if latest_interaction_b and latest_interaction_b.get("interaction_at"):
+            lines.append(
+                f"- Interaccion: {latest_interaction_b.get('interaction_at')} | {latest_interaction_b.get('source_type') or '-'} | {latest_interaction_b.get('related_name') or 'Sin nombre'}"
+            )
+        return "\n".join(lines)
+
     def _format_today_call_list(self, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "No encontre clientes sugeridos para llamar hoy."
@@ -3939,6 +4718,7 @@ class SalesAssistantService:
         if not rows:
             owner_label = owner_scope or "el equipo"
             return (
+                "En corto: hoy no veo una cuenta claramente priorizada para llamar.\n\n"
                 "Hechos:\n"
                 f"- No se detectaron clientes priorizados para llamar hoy para {owner_label}.\n\n"
                 "Interpretacion:\n"
@@ -3955,6 +4735,8 @@ class SalesAssistantService:
         recommendations = [f"- Prioriza primero a {row['related_name']}." for row in top[:3]]
         return "\n".join(
             [
+                f"En corto: si hoy solo haces una llamada, empezaria por {top[0]['related_name']}.",
+                "",
                 "Hechos:",
                 *facts,
                 "",
@@ -4082,8 +4864,10 @@ class SalesAssistantService:
         risks = profile.get("risks") or []
         if not risks:
             return f"No detecte riesgos claros para {entity_term} con la evidencia actual."
-        lines = [f"Riesgos detectados para {entity_term}:"]
+        lines = [f"Riesgos detectados para {entity_term}:", f"En corto: hoy veo {len(risks)} focos de atencion en esta cuenta."]
         lines.extend(f"- {risk}" for risk in risks)
+        lines.append("")
+        lines.append("Lectura comercial: conviene atacar primero el riesgo que bloquee contacto, seguimiento o avance de propuesta.")
         return "\n".join(lines)
 
     def _format_evidence_fallback(self, evidence: dict[str, Any]) -> str:
@@ -4106,17 +4890,17 @@ class SalesAssistantService:
         elif evidence.get("entity_suggestions") and evidence.get("entity_hint"):
             sections.append(self._format_entity_suggestions(evidence["entity_hint"], evidence["entity_suggestions"]))
         if evidence.get("recent_interactions"):
-            sections.append("Interacciones recientes:\n" + self._format_interaction_list(evidence["recent_interactions"], ""))
+            sections.append("Actividad reciente en CRM:\n" + self._format_interaction_list(evidence["recent_interactions"], ""))
         if evidence.get("recent_notes"):
             note_lines = []
             for note in evidence["recent_notes"][:5]:
                 note_lines.append(f"- {note.get('parent_name') or 'Sin nombre'} | {note.get('created_time') or '-'} | {(note.get('content_text') or '')[:220]}")
-            sections.append("Notas CRM:\n" + "\n".join(note_lines))
+            sections.append("Notas clave del CRM:\n" + "\n".join(note_lines))
         if evidence.get("document_chunks"):
             doc_lines = []
             for chunk in evidence["document_chunks"][:4]:
                 doc_lines.append(f"- {chunk['file_name']} | chunk {chunk['chunk_index']} | {chunk['content'][:220]}")
-            sections.append("Documentos:\n" + "\n".join(doc_lines))
+            sections.append("Soporte documental interno:\n" + "\n".join(doc_lines))
         return "\n\n".join(section for section in sections if section.strip()) or "No encontre evidencia suficiente para responder."
 
     def _build_prompt(self, question: str, intent: QuestionIntent, evidence: dict[str, Any], pack: EvidencePack) -> str:
@@ -4152,6 +4936,7 @@ class SalesAssistantService:
             "Piensa y respondes como un gerente comercial fuerte, no como un simple buscador del CRM.",
             "Ayudas a direccion y vendedores con KPIs, cartera, comparativas, historial de notas, compromisos, llamadas, oportunidades y contexto comercial por cliente.",
             "Responde en español claro, natural, ejecutivo y accionable.",
+            "Tu estilo debe sentirse cercano a ChatGPT nativo: adaptable, conversacional, preciso y nada robotico.",
             "Usa solo la evidencia proporcionada de Zoho CRM y PDFs locales.",
             "No inventes contactos, teléfonos, correos, responsables, unidades ni conclusiones.",
             "Si la evidencia es parcial, entrega lo que sí está respaldado y di claramente lo que falta.",
@@ -4161,10 +4946,13 @@ class SalesAssistantService:
             "Si el usuario pide estrategia, opinion, ranking, lectura comercial o plan, debes interpretar la evidencia y proponer un siguiente paso util.",
             "Si el usuario pide crear algo, entrega una pieza lista para usar.",
             "Si hay varias subsolicitudes en una misma pregunta, integralas en una sola respuesta coherente cuando sea posible.",
+            "Si la pregunta mezcla CRM, PDFs, tiempos y recomendacion, integra todo en una sola lectura ejecutiva en vez de responder por separado.",
             "Si el contexto es rico, puedes responder largo. Si el usuario solo pidio un dato puntual, responde corto.",
         ]
         if task.response_style == "commercial_advisor":
             instructions.append("Prioriza una respuesta con criterio comercial, conclusion, evidencia relevante y siguiente paso.")
+        if evidence.get("document_chunks"):
+            instructions.append("Si usas soporte de PDFs, menciona al final 'Fuentes internas consultadas:' seguido de los nombres de archivo relevantes.")
         if task.desired_format == "email":
             instructions.append("Entrega un correo listo para enviar, con asunto y cuerpo natural. Usa tono humano y comercial.")
         elif task.desired_format == "message":
@@ -4219,6 +5007,9 @@ class SalesAssistantService:
             f"KPIs entidad: {evidence.get('entity_kpis')}",
             f"Ventana temporal: {evidence.get('time_window')}",
             f"Resumen temporal: {evidence.get('time_review')}",
+            f"Ultima mencion de tema: {evidence.get('topic_mention')}",
+            f"Brecha temporal de cuenta: {evidence.get('time_gap_summary')}",
+            f"Cambio entre periodos: {evidence.get('period_change')}",
             "Fragmentos de documentos:\n" + serialize_rows(evidence.get("document_chunks", [])),
         ]
         direct_answer = evidence.get("direct_answer")

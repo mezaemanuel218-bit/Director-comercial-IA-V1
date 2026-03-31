@@ -195,8 +195,26 @@ def build_questions(samples: dict[str, list[str]]) -> list[dict[str, str]]:
         {"username": "emeza", "question": "segun los pdfs, que beneficios de flotimatics ayudan a una flotilla con mas control operativo"},
         {"username": "evaldez", "question": "hazme un resumen ejecutivo de los pdfs para vender flotimatics a direccion"},
         {"username": "emeza", "question": "con base en los documentos internos, dame argumentos de venta para una demo de geotab"},
+        {"username": "evaldez", "question": "segun zoho y los pdfs, como vamos con movimex, que riesgo ves y que siguiente paso recomendarias esta semana"},
+        {"username": "emeza", "question": "con base en zoho y los documentos internos, dame un resumen ejecutivo de movimex y luego redactame un correo corto para retomar la demo"},
+        {"username": "evaldez", "question": "dame un resumen ejecutivo del equipo comercial, kpi global de la semana de todos los vendedores y a quien deberiamos empujar primero"},
     ]
     questions.extend(product_questions)
+
+    temporal_questions = [
+        {"username": "emeza", "question": "que paso hoy"},
+        {"username": "emeza", "question": "que paso ayer"},
+        {"username": "emeza", "question": "que paso esta semana"},
+        {"username": "evaldez", "question": "kpi global de la semana de todos los vendedores"},
+        {"username": "evaldez", "question": "quien agrego algo el 19 de marzo de 2026"},
+        {"username": "emeza", "question": "que comentarios hubo el 18 de marzo de 2026"},
+        {"username": "emeza", "question": "que compromisos hubo el 13 de marzo de 2023"},
+        {"username": "emeza", "question": "que cambio entre febrero y marzo en movimex"},
+        {"username": "emeza", "question": "ultima vez que hablo de demo en hieleria veracruz"},
+        {"username": "emeza", "question": "cuanto tiempo paso entre la primera nota y la ultima llamada de movimex"},
+        {"username": "evaldez", "question": "que paso con movimex el 11 de marzo de 2026 y que comentarios hubo y que compromisos hubo"},
+    ]
+    questions.extend(temporal_questions)
 
     while len(questions) < 420:
         entity = entities[len(questions) % max(1, len(entities))]

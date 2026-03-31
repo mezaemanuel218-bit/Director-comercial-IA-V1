@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from assistant_core.auth import AppUser, authenticate_user, get_user, session_secret_key
 from assistant_core.config import BOOTSTRAP_WAREHOUSE_DB, PROJECT_ROOT, WAREHOUSE_DB
 from assistant_core.documents import index_documents, indexed_documents_count
-from assistant_core.history import ensure_history_schema, fetch_history, save_history
+from assistant_core.history import ensure_history_schema, fetch_feedback, fetch_history, save_feedback, save_history
 from assistant_core.reporting import available_owners, dashboard_metrics
 from assistant_core.runtime_state import ensure_runtime_schema, get_runtime_value, set_runtime_value
 from assistant_core.service import SalesAssistantService
@@ -221,6 +221,7 @@ class AskResponse(BaseModel):
     sources: list[str]
     used_web: bool
     answer: str
+    history_id: int | None = None
 
 
 class HealthResponse(BaseModel):
@@ -251,6 +252,33 @@ class HistoryItem(BaseModel):
     sources: str | None = None
     used_web: int
     created_at: str
+
+
+class FeedbackRequest(BaseModel):
+    history_id: int = Field(..., ge=1)
+    rating: str = Field(..., pattern="^(good|bad)$")
+    correction: str | None = Field(default=None, max_length=4000)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class FeedbackItem(BaseModel):
+    id: int
+    history_id: int
+    username: str | None = None
+    rating: str
+    correction: str | None = None
+    notes: str | None = None
+    question: str
+    answer: str
+    mode: str | None = None
+    sources: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class FeedbackResponse(BaseModel):
+    status: str
+    item: FeedbackItem
 
 
 class DashboardResponse(BaseModel):
@@ -343,7 +371,7 @@ def me(user: AppUser = Depends(require_user)) -> UserResponse:
 def ask(payload: AskRequest, user: AppUser = Depends(require_user)) -> AskResponse:
     try:
         result = assistant_service.answer_question(payload.question, user=user)
-        save_history(
+        history_id = save_history(
             question=payload.question,
             answer=result.answer,
             mode=result.mode,
@@ -359,6 +387,7 @@ def ask(payload: AskRequest, user: AppUser = Depends(require_user)) -> AskRespon
         sources=result.sources,
         used_web=result.used_web,
         answer=result.answer,
+        history_id=history_id,
     )
 
 
@@ -410,6 +439,37 @@ def history(limit: int = 20, user: AppUser = Depends(require_user)) -> list[Hist
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return [HistoryItem(**item) for item in items]
+
+
+@app.post("/feedback", response_model=FeedbackResponse)
+def feedback(payload: FeedbackRequest, user: AppUser = Depends(require_user)) -> FeedbackResponse:
+    try:
+        feedback_id = save_feedback(
+            history_id=payload.history_id,
+            rating=payload.rating,
+            username=user.username,
+            correction=payload.correction,
+            notes=payload.notes,
+        )
+        item = next(
+            (row for row in fetch_feedback(limit=50, username=user.username) if row["id"] == feedback_id),
+            None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not item:
+        raise HTTPException(status_code=500, detail="No se pudo guardar el feedback.")
+    return FeedbackResponse(status="ok", item=FeedbackItem(**item))
+
+
+@app.get("/feedback", response_model=list[FeedbackItem])
+def feedback_list(limit: int = 30, user: AppUser = Depends(require_user)) -> list[FeedbackItem]:
+    try:
+        items = fetch_feedback(limit=limit, username=user.username)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return [FeedbackItem(**item) for item in items]
 
 
 @app.get("/dashboard", response_model=DashboardResponse)

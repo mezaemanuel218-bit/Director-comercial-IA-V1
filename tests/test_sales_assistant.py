@@ -14,6 +14,7 @@ class SalesAssistantServiceTests(unittest.TestCase):
         desktop_db = Path(r"C:\Users\sopor\OneDrive\Datos adjuntos\Desktop\Director Comercial IA\data\warehouse.db")
         db_path = str(desktop_db) if desktop_db.exists() else None
         cls.service = SalesAssistantService(db_path=db_path)
+        cls.service.client = None
         cls.emeza = get_user("emeza")
 
     def test_movimex_contact_query_detects_note_and_crm_emails(self) -> None:
@@ -70,8 +71,16 @@ class SalesAssistantServiceTests(unittest.TestCase):
     def test_global_weekly_kpis_are_not_treated_as_entity_lookup(self) -> None:
         response = self.service.answer_question("kpi global de la semana de todos los vendedores", user=get_user("evaldez"))
         answer = response.answer.lower()
+        self.assertIn("en corto:", answer)
         self.assertIn("panorama comercial del equipo flotimatics", answer)
         self.assertNotIn("lo mas cercano que si veo en crm es", answer)
+
+    def test_executive_team_brief_uses_decision_style(self) -> None:
+        response = self.service.answer_question("dame un resumen ejecutivo del equipo comercial", user=get_user("evaldez"))
+        answer = response.answer.lower()
+        self.assertIn("resumen ejecutivo del equipo", answer)
+        self.assertIn("decision sugerida", answer)
+        self.assertIn("siguiente paso recomendado", answer)
 
     def test_entity_comparison_uses_existing_crm_evidence(self) -> None:
         response = self.service.answer_question("compara Hieleria Veracruz vs Servicios y Minas de Mexico Actus")
@@ -146,6 +155,7 @@ class SalesAssistantServiceTests(unittest.TestCase):
     def test_owner_brief_lists_hot_and_cold_accounts(self) -> None:
         response = self.service.answer_question("dame clientes calientes y clientes frios", user=self.emeza)
         answer = response.answer.lower()
+        self.assertIn("en corto:", answer)
         self.assertIn("clientes calientes", answer)
         self.assertIn("clientes frios", answer)
 
@@ -170,6 +180,30 @@ class SalesAssistantServiceTests(unittest.TestCase):
             ["dame resumen de movimex", "redactame un correo"],
         )
         self.assertEqual(parts[1], "redactame un correo para movimex")
+
+    def test_compound_question_keeps_time_context_for_followups(self) -> None:
+        parts = self.service._contextualize_subquestions(
+            "que paso con movimex el 11 de marzo de 2026 y luego que comentarios hubo y que compromisos hubo",
+            ["que paso con movimex el 11 de marzo de 2026", "que comentarios hubo", "que compromisos hubo"],
+        )
+        self.assertIn("2026-03-11", parts[1])
+        self.assertIn("2026-03-11", parts[2])
+
+    def test_compound_question_keeps_document_scope_for_followups(self) -> None:
+        parts = self.service._contextualize_subquestions(
+            "segun los pdfs, dame argumentos de venta para geotab y luego objeciones probables y como responderlas",
+            ["dame argumentos de venta para geotab", "objeciones probables y como responderlas"],
+        )
+        self.assertIn("documentos internos", parts[1].lower())
+
+    def test_fallback_split_handles_ceo_style_commas_and_followups(self) -> None:
+        parts = self.service._fallback_semantic_like_split(
+            "segun zoho y los pdfs, como vamos con movimex, que riesgo ves y que siguiente paso recomendarias esta semana"
+        )
+        self.assertGreaterEqual(len(parts), 3)
+        self.assertIn("movimex", parts[0].lower())
+        self.assertIn("riesgo", parts[1].lower())
+        self.assertIn("siguiente paso", parts[2].lower())
 
     def test_question_mark_compound_keeps_entity_context(self) -> None:
         parts = self.service._contextualize_subquestions(
@@ -217,6 +251,13 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertIn("movimex", answer)
         self.assertNotIn("no encontre evidencia suficiente para responder", answer)
 
+    def test_executive_entity_brief_uses_decision_style(self) -> None:
+        response = self.service.answer_question("dame un resumen ejecutivo de movimex")
+        answer = response.answer.lower()
+        self.assertIn("resumen ejecutivo de movimex", answer)
+        self.assertIn("decision sugerida", answer)
+        self.assertIn("siguiente paso recomendado", answer)
+
     def test_status_query_for_entity_should_not_need_exact_phrase(self) -> None:
         response = self.service.answer_question("Como vamos con JIBE?")
         answer = response.answer.lower()
@@ -247,6 +288,17 @@ class SalesAssistantServiceTests(unittest.TestCase):
         self.assertTrue(chunks)
         flattened = " ".join(f"{row.get('file_name', '')} {row.get('content', '')}" for row in chunks).lower()
         self.assertIn("geotab", flattened)
+
+    def test_document_focused_question_returns_internal_sources_in_answer(self) -> None:
+        response = self.service.answer_question("segun los pdfs, que beneficios de flotimatics ayudan a una flotilla con mas control operativo")
+        answer = response.answer.lower()
+        self.assertIn("fuentes internas consultadas", answer)
+
+    def test_document_backed_sales_material_mentions_internal_support(self) -> None:
+        response = self.service.answer_question("con base en los documentos internos, dame argumentos de venta para una demo de geotab")
+        answer = response.answer.lower()
+        self.assertIn("fuentes internas consultadas", answer)
+        self.assertIn("geotab", answer)
 
     def test_time_window_parser_supports_specific_day(self) -> None:
         window = self.service._parse_time_window("que paso el 19 de marzo de 2026")
@@ -305,6 +357,55 @@ class SalesAssistantServiceTests(unittest.TestCase):
         answer = response.answer.lower()
         self.assertIn("movimex", answer)
         self.assertIn("2026-03-11", answer)
+
+    def test_last_topic_mention_for_entity_returns_demo_reference(self) -> None:
+        response = self.service.answer_question("ultima vez que hablo de demo en Hieleria Veracruz")
+        answer = response.answer.lower()
+        self.assertIn("demo", answer)
+        self.assertIn("hieleria veracruz", answer)
+
+    def test_entity_time_gap_summary_uses_first_note_and_latest_touch(self) -> None:
+        response = self.service.answer_question("cuanto tiempo paso entre la primera nota y la ultima llamada de movimex")
+        answer = response.answer.lower()
+        self.assertIn("movimex", answer)
+        self.assertTrue("pasaron" in answer or "no pude calcular" in answer)
+
+    def test_entity_period_change_between_months_returns_delta(self) -> None:
+        response = self.service.answer_question("que cambio entre febrero y marzo en movimex")
+        answer = response.answer.lower()
+        self.assertIn("movimex", answer)
+        self.assertIn("febrero", answer)
+        self.assertIn("marzo", answer)
+
+    def test_rule_based_combine_subresponses_creates_executive_sections(self) -> None:
+        combined = self.service._rule_based_combine_subresponses(
+            "dame resumen de movimex y luego riesgos y luego redactame un correo",
+            [
+                "dame resumen de movimex",
+                "que riesgos ves en movimex",
+                "redactame un correo para movimex",
+            ],
+            [
+                self.service.answer_question("dame resumen de movimex"),
+                self.service.answer_question("que riesgos ves en movimex"),
+                self.service.answer_question("redactame un correo para movimex"),
+            ],
+        )
+        self.assertIsNotNone(combined)
+        lowered = combined.lower()
+        self.assertIn("panorama:", lowered)
+        self.assertIn("riesgos y bloqueadores:", lowered)
+        self.assertIn("pieza lista:", lowered)
+
+    def test_ceo_style_multi_topic_question_returns_integrated_sections(self) -> None:
+        response = self.service.answer_question(
+            "segun zoho y los pdfs, como vamos con movimex, que riesgo ves y que siguiente paso recomendarias esta semana"
+        )
+        answer = response.answer.lower()
+        self.assertIn("movimex", answer)
+        self.assertTrue("panorama:" in answer or "resumen ejecutivo de movimex" in answer)
+        self.assertTrue("riesgos y bloqueadores:" in answer or "riesgos detectados" in answer)
+        self.assertTrue("recomendacion:" in answer or "siguiente paso recomendado:" in answer)
 
     def test_free_minutes_work_plan_should_not_jump_to_random_account(self) -> None:
         response = self.service.answer_question("tengo 30 min libres, hazme un plan de trabajo", user=self.emeza)

@@ -214,6 +214,8 @@ def classify_question(question: str) -> QuestionIntent:
         token in q
         for token in [
             "resumen del equipo",
+            "resumen ejecutivo del equipo",
+            "resumen ejecutivo del equipo comercial",
             "resumen comercial del equipo",
             "kpi global",
             "kpis globales",

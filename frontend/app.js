@@ -16,6 +16,14 @@ const modePill = document.getElementById("modePill");
 const sourcePill = document.getElementById("sourcePill");
 const webPill = document.getElementById("webPill");
 const feedbackBanner = document.getElementById("feedbackBanner");
+const feedbackPanel = document.getElementById("feedbackPanel");
+const feedbackGoodButton = document.getElementById("feedbackGoodButton");
+const feedbackBadButton = document.getElementById("feedbackBadButton");
+const feedbackBadForm = document.getElementById("feedbackBadForm");
+const feedbackCorrection = document.getElementById("feedbackCorrection");
+const feedbackNotes = document.getElementById("feedbackNotes");
+const feedbackSubmitButton = document.getElementById("feedbackSubmitButton");
+const feedbackCancelButton = document.getElementById("feedbackCancelButton");
 const refreshOutput = document.getElementById("refreshOutput");
 const syncStatusBadge = document.getElementById("syncStatusBadge");
 const syncTimer = document.getElementById("syncTimer");
@@ -34,10 +42,13 @@ const pendingTasksList = document.getElementById("pendingTasksList");
 const staleContactsList = document.getElementById("staleContactsList");
 const recentActivityList = document.getElementById("recentActivityList");
 const historyList = document.getElementById("historyList");
+const feedbackList = document.getElementById("feedbackList");
 const prioritiesTable = document.getElementById("prioritiesTable");
 let refreshCooldownTimer = null;
 let refreshStatusPollTimer = null;
 let syncElapsedTimer = null;
+let currentHistoryId = null;
+let currentFeedbackRating = null;
 
 function formatCooldown(seconds) {
   if (!seconds || seconds <= 0) return "";
@@ -240,7 +251,7 @@ async function login() {
     }
     loginPassword.value = "";
     await fetchCurrentUser();
-    await Promise.all([loadOwners(), loadDashboard(), loadHistory()]);
+    await Promise.all([loadOwners(), loadDashboard(), loadHistory(), loadFeedback()]);
   } catch (error) {
     loginMessage.textContent = error.message || "No se pudo iniciar sesion.";
   } finally {
@@ -251,6 +262,8 @@ async function login() {
 
 async function logout() {
   await fetch("/logout", { method: "POST" });
+  currentHistoryId = null;
+  resetFeedbackPanel();
   await fetchCurrentUser();
 }
 
@@ -268,6 +281,25 @@ function clearBanner() {
   feedbackBanner.textContent = "";
 }
 
+function resetFeedbackPanel() {
+  currentFeedbackRating = null;
+  feedbackCorrection.value = "";
+  feedbackNotes.value = "";
+  feedbackBadForm.classList.add("hidden");
+  feedbackPanel.classList.add("hidden");
+  feedbackGoodButton.disabled = false;
+  feedbackBadButton.disabled = false;
+  feedbackSubmitButton.disabled = false;
+}
+
+function showFeedbackPanel(historyId) {
+  currentHistoryId = historyId || null;
+  resetFeedbackPanel();
+  if (currentHistoryId) {
+    feedbackPanel.classList.remove("hidden");
+  }
+}
+
 async function askQuestion() {
   const question = questionInput.value.trim();
   if (!question) {
@@ -277,6 +309,7 @@ async function askQuestion() {
   }
 
   clearBanner();
+  resetFeedbackPanel();
   askButton.disabled = true;
   askButton.textContent = "Consultando...";
   answerOutput.textContent = "Analizando CRM, notas y documentos para responder con evidencia...";
@@ -302,8 +335,10 @@ async function askQuestion() {
     modePill.textContent = `Modo: ${data.mode}`;
     sourcePill.textContent = `Fuentes: ${data.sources.join(", ") || "-"}`;
     webPill.textContent = `Web: ${data.used_web ? "si" : "no"}`;
-    await loadHistory();
+    showFeedbackPanel(data.history_id);
+    await Promise.all([loadHistory(), loadFeedback()]);
   } catch (error) {
+    currentHistoryId = null;
     answerOutput.textContent = "No se pudo obtener una respuesta.";
     setBanner(error.message || "Ocurrio un error al consultar.", true);
   } finally {
@@ -512,16 +547,85 @@ async function loadHistory() {
         <p class="history-answer">${item.answer}</p>
       `;
       wrapper.addEventListener("click", () => {
+        currentHistoryId = item.id;
         questionInput.value = item.question;
         answerOutput.textContent = item.answer;
         modePill.textContent = `Modo: ${item.mode || "-"}`;
         sourcePill.textContent = `Fuentes: ${item.sources || "-"}`;
         webPill.textContent = `Web: ${item.used_web ? "si" : "no"}`;
+        showFeedbackPanel(item.id);
       });
       historyList.appendChild(wrapper);
     });
   } catch (error) {
     historyList.textContent = "No se pudo cargar el historial.";
+  }
+}
+
+async function submitFeedback(rating, correction = "", notes = "") {
+  if (!currentHistoryId) {
+    setBanner("Todavia no hay una respuesta seleccionada para calificar.", true);
+    return;
+  }
+
+  try {
+    const response = await fetch("/feedback", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        history_id: currentHistoryId,
+        rating,
+        correction: correction.trim() || null,
+        notes: notes.trim() || null,
+      }),
+    });
+    const data = await readJsonSafely(response);
+    if (!response.ok) {
+      throw new Error(data.detail || "No se pudo guardar el feedback.");
+    }
+    setBanner(
+      rating === "good"
+        ? "Feedback guardado. Esta respuesta queda marcada como util."
+        : "Feedback guardado. La correccion quedo disponible para mejorar respuestas futuras."
+    );
+    resetFeedbackPanel();
+    feedbackPanel.classList.remove("hidden");
+    await loadFeedback();
+  } catch (error) {
+    setBanner(error.message || "No se pudo guardar el feedback.", true);
+  }
+}
+
+async function loadFeedback() {
+  try {
+    const response = await fetch("/feedback?limit=12");
+    if (response.status === 401) {
+      return;
+    }
+    const data = await readJsonSafely(response);
+    if (!data.length) {
+      feedbackList.textContent = "Todavia no hay feedback registrado.";
+      return;
+    }
+
+    feedbackList.innerHTML = "";
+    data.forEach((item) => {
+      const wrapper = document.createElement("article");
+      wrapper.className = "history-item feedback-item";
+      wrapper.innerHTML = `
+        <div class="history-meta">
+          <span class="feedback-rating ${item.rating}">${item.rating === "good" ? "Bien" : "Mal"}</span>
+          ${item.updated_at}
+        </div>
+        <h3 class="history-question">${item.question}</h3>
+        <p class="history-answer">${item.correction || item.notes || "Sin comentario adicional."}</p>
+      `;
+      feedbackList.appendChild(wrapper);
+    });
+  } catch (error) {
+    feedbackList.textContent = "No se pudo cargar el feedback.";
   }
 }
 
@@ -536,6 +640,23 @@ askButton.addEventListener("click", askQuestion);
 refreshButton.addEventListener("click", refreshData);
 loginButton.addEventListener("click", login);
 logoutButton.addEventListener("click", logout);
+feedbackGoodButton.addEventListener("click", async () => {
+  await submitFeedback("good");
+});
+feedbackBadButton.addEventListener("click", () => {
+  currentFeedbackRating = "bad";
+  feedbackBadForm.classList.remove("hidden");
+  feedbackCorrection.focus();
+});
+feedbackCancelButton.addEventListener("click", () => {
+  currentFeedbackRating = null;
+  feedbackBadForm.classList.add("hidden");
+  feedbackCorrection.value = "";
+  feedbackNotes.value = "";
+});
+feedbackSubmitButton.addEventListener("click", async () => {
+  await submitFeedback(currentFeedbackRating || "bad", feedbackCorrection.value, feedbackNotes.value);
+});
 applyFiltersButton.addEventListener("click", loadDashboard);
 clearFiltersButton.addEventListener("click", async () => {
   ownerFilter.value = "";
@@ -563,5 +684,6 @@ fetchCurrentUser().then((user) => {
     loadOwners();
     loadDashboard();
     loadHistory();
+    loadFeedback();
   }
 });

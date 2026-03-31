@@ -120,6 +120,25 @@
 
         <div id="feedbackBanner" class="feedback-banner hidden"></div>
         <pre id="answerOutput" class="answer-output">Aqui aparecera la respuesta.</pre>
+        <div id="feedbackPanel" class="answer-feedback hidden">
+          <div class="feedback-actions">
+            <span class="feedback-title">¿Esta respuesta te sirvio?</span>
+            <div class="feedback-buttons">
+              <button id="feedbackGoodButton" class="secondary-button">Bien</button>
+              <button id="feedbackBadButton" class="secondary-button">Mal</button>
+            </div>
+          </div>
+          <div id="feedbackBadForm" class="feedback-form hidden">
+            <label class="input-label" for="feedbackCorrection">¿Que debio responder o que falto?</label>
+            <textarea id="feedbackCorrection" class="feedback-textarea" placeholder="Ejemplo: Debio mencionar que Ricardo Partida es el contacto de GPS y que la demo sigue pendiente."></textarea>
+            <label class="input-label" for="feedbackNotes">Nota opcional</label>
+            <textarea id="feedbackNotes" class="feedback-textarea compact" placeholder="Contexto adicional para mejorar futuras respuestas."></textarea>
+            <div class="panel-actions compact">
+              <button id="feedbackSubmitButton" class="primary-button">Guardar correccion</button>
+              <button id="feedbackCancelButton" class="secondary-button">Cancelar</button>
+            </div>
+          </div>
+        </div>
 
         <div class="refresh-summary">
           <h3>Estado de sincronizacion</h3>
@@ -219,6 +238,13 @@
           </div>
         </div>
         <div id="historyList" class="history-list">Todavia no hay preguntas registradas.</div>
+        <div class="response-head feedback-history-head">
+          <div>
+            <p class="panel-kicker">Feedback</p>
+            <h2>Correcciones recientes</h2>
+          </div>
+        </div>
+        <div id="feedbackList" class="history-list">Todavia no hay feedback registrado.</div>
       </section>
     </section>
   </div>
